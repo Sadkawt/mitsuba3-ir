@@ -4,6 +4,7 @@
 #include <mitsuba/render/bsdf.h>
 #include <mitsuba/render/sensor.h>
 #include <mitsuba/render/medium.h>
+#include <mitsuba/render/texture.h>
 #include <mitsuba/core/plugin.h>
 
 #if defined(MI_ENABLE_EMBREE)
@@ -24,6 +25,10 @@ MI_VARIANT Shape<Float, Spectrum>::Shape(const Properties &props)
         (ScalarAffineTransform4f) props.get<ScalarAffineTransform4f>("to_world", ScalarAffineTransform4f());
 
     for (auto &prop : props.objects()) {
+        // The radiance field is handled separately below (via
+        // get_emissive_texture), so it is not stored as a texture attribute.
+        if (prop.name() == "radiance")
+            continue;
         if (Emitter *emitter = prop.try_get<Emitter>()) {
             if (m_emitter)
                 Throw("Only a single Emitter child object can be specified per shape.");
@@ -50,6 +55,13 @@ MI_VARIANT Shape<Float, Spectrum>::Shape(const Properties &props)
             add_texture_attribute(prop.name(), texture);
         }
     }
+
+    // Optional lightweight emissive radiance field. Unlike an `<emitter>`, this
+    // is evaluated directly on ray intersection and does not participate in NEE
+    // or emitter sampling. It accepts the same value/texture forms as an area
+    // light's `radiance` parameter (spectrum, rgb, float or nested texture).
+    if (props.has_property("radiance"))
+        m_radiance = props.get_emissive_texture<Texture>("radiance");
 
     // Create a default diffuse BSDF if needed.
     if (!m_bsdf) {
@@ -581,6 +593,18 @@ Shape<Float, Spectrum>::eval_attribute_x(std::string_view /*name*/,
         NotImplementedError("eval_attribute_x");
 }
 
+MI_VARIANT typename Shape<Float, Spectrum>::UnpolarizedSpectrum
+Shape<Float, Spectrum>::eval_radiance(const SurfaceInteraction3f &si,
+                                      Mask active) const {
+    if (!m_radiance)
+        return 0.f;
+
+    // Emit only towards the front-facing side, matching an area emitter
+    // (`cos_theta(si.wi) > 0`, i.e. the viewer is above the surface).
+    UnpolarizedSpectrum value = m_radiance->eval(si, active);
+    return value & (si.wi.z() > 0.f);
+}
+
 MI_VARIANT Float Shape<Float, Spectrum>::surface_area() const {
     NotImplementedError("surface_area");
 }
@@ -620,6 +644,8 @@ MI_VARIANT void Shape<Float, Spectrum>::traverse(TraversalCallback *cb) {
     cb->put("bsdf", m_bsdf, ParamFlags::Differentiable);
     if (m_emitter)
         cb->put("emitter",         m_emitter,         ParamFlags::Differentiable);
+    if (m_radiance)
+        cb->put("radiance",        m_radiance,        ParamFlags::Differentiable);
     if (m_sensor)
         cb->put("sensor",          m_sensor,          ParamFlags::Differentiable);
     if (m_interior_medium)
@@ -692,6 +718,7 @@ MI_VARIANT std::string Shape<Float, Spectrum>::get_children_string() const {
     std::vector<std::pair<std::string, const Object*>> children;
     children.push_back({ "bsdf", m_bsdf });
     if (m_emitter) children.push_back({ "emitter", m_emitter });
+    if (m_radiance) children.push_back({ "radiance", m_radiance });
     if (m_sensor) children.push_back({ "sensor", m_sensor });
     if (m_interior_medium) children.push_back({ "interior_medium", m_interior_medium });
     if (m_exterior_medium) children.push_back({ "exterior_medium", m_exterior_medium });
