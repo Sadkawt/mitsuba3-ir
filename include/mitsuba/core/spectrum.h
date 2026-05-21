@@ -127,6 +127,12 @@ struct Spectrum<dr::detail::MaskedArray<Value_>, Size_>
 #define MI_CIE_MAX           830.f
 #define MI_CIE_SAMPLES       95
 
+/* Spectral sampling range used by the renderer (mitsubaIR fork).
+   Extended from the visible band to 12 micrometers to cover thermal IR.
+   The CIE color matching tables (MI_CIE_*) still use the visible range. */
+#define MI_WAVELENGTH_MIN    360.f
+#define MI_WAVELENGTH_MAX    12000.f
+
 /* Scaling the CIE curves by the following constant ensures that
    a unit-valued spectrum integrates to a luminance of 1.0 */
 #define MI_CIE_Y_NORMALIZATION (1.0 / 106.7502593994140625)
@@ -474,8 +480,19 @@ std::pair<wavelength_t<Spectrum>, Spectrum> sample_wavelength(Float sample) {
         // Wavelengths should not be used when rendering in RGB or monochromatic modes.
         return { {}, 1.f };
     } else {
-        auto wav_sample = math::sample_shifted<wavelength_t<Spectrum>>(sample);
-        return sample_rgb_spectrum(wav_sample);
+        // mitsubaIR: uniform sampling across the extended (incl. IR) range.
+        // The visible-biased atanh sampler from sample_rgb_spectrum is wrong
+        // for thermal IR scenes (it would assign zero weight outside ~360-830 nm).
+        using Wavelength = wavelength_t<Spectrum>;
+        using ScalarFloat = dr::scalar_t<Float>;
+        constexpr ScalarFloat lo = (ScalarFloat) MI_WAVELENGTH_MIN;
+        constexpr ScalarFloat hi = (ScalarFloat) MI_WAVELENGTH_MAX;
+        constexpr ScalarFloat range = hi - lo;
+        Wavelength wav_sample = math::sample_shifted<Wavelength>(sample);
+        Wavelength wavelengths = lo + range * wav_sample;
+        // PDF is 1/range (per nm); the weight is the reciprocal.
+        Spectrum weight = Spectrum(range);
+        return { wavelengths, weight };
     }
 }
 

@@ -52,8 +52,8 @@ public:
 
     UniformSpectrum(const Properties &props) : Texture(props) {
         m_value = dr::opaque<Float>(props.get<ScalarFloat>("value"));
-        m_range = ScalarVector2f(props.get<ScalarFloat>("wavelength_min", MI_CIE_MIN),
-                                 props.get<ScalarFloat>("wavelength_max", MI_CIE_MAX));
+        m_range = ScalarVector2f(props.get<ScalarFloat>("wavelength_min", MI_WAVELENGTH_MIN),
+                                 props.get<ScalarFloat>("wavelength_max", MI_WAVELENGTH_MAX));
     }
 
     void traverse(TraversalCallback *cb) override {

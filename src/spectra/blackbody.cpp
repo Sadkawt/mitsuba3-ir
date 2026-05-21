@@ -19,7 +19,7 @@ Blackbody spectrum (:monosp:`blackbody`)
 
  * - wavelength_max
    - |float|
-   - Maximum wavelength of the spectral range in nanometers. (Default: 830nm)
+   - Maximum wavelength of the spectral range in nanometers. (Default: 12000nm; mitsubaIR fork extends into the thermal IR)
 
  * - temperature
    - |float|
@@ -83,8 +83,8 @@ public:
     BlackBodySpectrum(const Properties &props) : Texture(props) {
         m_temperature = props.get<ScalarFloat>("temperature");
         m_wavelength_range = ScalarVector2f(
-            props.get<ScalarFloat>("wavelength_min", MI_CIE_MIN),
-            props.get<ScalarFloat>("wavelength_max", MI_CIE_MAX)
+            props.get<ScalarFloat>("wavelength_min", MI_WAVELENGTH_MIN),
+            props.get<ScalarFloat>("wavelength_max", MI_WAVELENGTH_MAX)
         );
         parameters_changed();
     }

@@ -100,7 +100,7 @@ Texture<Float, Spectrum>::spectral_resolution() const {
 
 MI_VARIANT typename Texture<Float, Spectrum>::ScalarVector2f
 Texture<Float, Spectrum>::wavelength_range() const {
-    return ScalarVector2f(MI_CIE_MIN, MI_CIE_MAX);
+    return ScalarVector2f(MI_WAVELENGTH_MIN, MI_WAVELENGTH_MAX);
 }
 
 MI_VARIANT typename Texture<Float, Spectrum>::ScalarFloat

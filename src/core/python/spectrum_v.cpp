@@ -65,6 +65,8 @@ MI_PY_EXPORT(Spectrum) {
     m.attr("MI_CIE_MAX") = MI_CIE_MAX;
     m.attr("MI_CIE_Y_NORMALIZATION") = MI_CIE_Y_NORMALIZATION;
     m.attr("MI_CIE_D65_NORMALIZATION") = MI_CIE_D65_NORMALIZATION;
+    m.attr("MI_WAVELENGTH_MIN") = MI_WAVELENGTH_MIN;
+    m.attr("MI_WAVELENGTH_MAX") = MI_WAVELENGTH_MAX;
 
     m.def("unpolarized_spectrum", [](const Spectrum &s) { return unpolarized_spectrum(s); }, "");
     m.def("depolarizer", [](const Spectrum &s) { return depolarizer(s); }, "");
