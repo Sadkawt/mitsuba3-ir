@@ -16,6 +16,11 @@
 __pycache__
 *.pyc
 /wheelhouse
+/.venv
+.venv/
+
+# Rendered output (IR scripts write here)
+/renders
 
 # macOS
 \.DS_Store
