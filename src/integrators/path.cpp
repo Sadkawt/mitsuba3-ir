@@ -221,6 +221,31 @@ public:
                     ls.result);
             }
 
+            // -------------------- Shape radiance field --------------------
+
+            /* In addition to (or instead of) area emitters, a shape may carry
+               a lightweight emissive radiance field. It is *not* registered as
+               a scene emitter and therefore does not participate in NEE or
+               emitter importance sampling: we simply add its contribution at
+               full weight whenever a ray happens to intersect the shape (this
+               is equivalent to a BSDF-sampling-only estimator, hence unbiased).
+               This avoids the per-emitter memory and sampling overhead that
+               becomes prohibitive for scenes with very many light sources. */
+            /* Guard the shape method call with `si.is_valid()`: in scalar mode
+               `si.shape` is a raw pointer that is null when the ray misses, and
+               the JIT call machinery (which masks null instances) does not
+               apply there. */
+            if (dr::any_or<true>(si.is_valid())) {
+                UnpolarizedSpectrum radiance =
+                    si.shape->eval_radiance(si, si.is_valid());
+                Mask has_radiance = si.is_valid() && (dr::max(radiance) > 0.f);
+
+                ls.result = spec_fma(ls.throughput,
+                                     depolarizer<Spectrum>(radiance),
+                                     ls.result);
+                ls.valid_ray |= has_radiance;
+            }
+
             // Continue tracing the path at this point?
             Bool active_next = (ls.depth + 1 < m_max_depth) && si.is_valid();
 

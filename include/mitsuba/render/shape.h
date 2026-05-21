@@ -890,6 +890,32 @@ public:
     /// Return the area emitter associated with this shape (if any)
     Emitter *emitter(Mask /*unused*/ = true) { return m_emitter.get(); }
 
+    /**
+     * \brief Does this shape carry a (lightweight) emissive radiance field?
+     *
+     * A radiance field is a cheap alternative to attaching an \ref Emitter to
+     * a shape. It is evaluated directly whenever a ray intersects the shape and
+     * is *not* registered as a scene emitter, i.e. it does not participate in
+     * next-event estimation (NEE) nor emitter importance sampling. This avoids
+     * the per-emitter memory and sampling overhead that becomes prohibitive
+     * when a scene contains a very large number of light sources (e.g. infrared
+     * simulations).
+     */
+    bool is_emissive_field() const { return (bool) m_radiance; }
+
+    /**
+     * \brief Evaluate the shape's radiance field at a surface interaction.
+     *
+     * Returns the (unpolarized) radiance emitted towards the viewer encoded in
+     * \c si.wi. Like an area emitter, emission only occurs on the front-facing
+     * side (\c cos_theta(si.wi) > 0). Shapes without a radiance field return 0.
+     */
+    UnpolarizedSpectrum eval_radiance(const SurfaceInteraction3f &si,
+                                      Mask active = true) const;
+
+    /// Return the radiance field texture associated with this shape (if any)
+    const Texture *radiance() const { return m_radiance.get(); }
+
     /// Is this shape also an area sensor?
     bool is_sensor() const { return (bool) m_sensor; }
 
@@ -1045,6 +1071,8 @@ protected:
 protected:
     ref<BSDF> m_bsdf;
     ref<Emitter> m_emitter;
+    /// Optional lightweight emissive radiance field (not a scene emitter)
+    ref<Texture> m_radiance;
     ref<Sensor> m_sensor;
     ref<Medium> m_interior_medium;
     ref<Medium> m_exterior_medium;
@@ -1074,8 +1102,9 @@ protected:
     /// True if the shape has called initialize() at least once
     bool m_initialized = false;
 
-    MI_DECLARE_TRAVERSE_CB(m_bsdf, m_emitter, m_sensor, m_interior_medium,
-                           m_exterior_medium, m_texture_attributes, m_to_world)
+    MI_DECLARE_TRAVERSE_CB(m_bsdf, m_emitter, m_radiance, m_sensor,
+                           m_interior_medium, m_exterior_medium,
+                           m_texture_attributes, m_to_world)
 };
 
 // -----------------------------------------------------------------------
@@ -1170,6 +1199,7 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Shape)
     DRJIT_CALL_METHOD(compute_surface_interaction)
     DRJIT_CALL_METHOD(has_attribute)
     DRJIT_CALL_METHOD(eval_attribute)
+    DRJIT_CALL_METHOD(eval_radiance)
     DRJIT_CALL_METHOD(eval_attribute_1)
     DRJIT_CALL_METHOD(eval_attribute_3)
     DRJIT_CALL_METHOD(eval_attribute_x)
