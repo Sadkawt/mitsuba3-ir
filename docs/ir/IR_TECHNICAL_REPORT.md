@@ -802,9 +802,16 @@ resistance); they are validated against the closed-form equilibrium in
 #### 6.8.1 Shadows and sky view from the scene
 
 `ThermalScene` loads the user's scene (sensors, integrators and emitters
-stripped) and samples each simulated shape on a UV grid through
-`Shape::eval_parameterization` (meshes without UVs fall back to their
-vertices). For every 5-minute step with the sun above the horizon a shadow
+stripped) and samples each simulated shape: analytic shapes (rectangle,
+sphere, disk, cylinder) on a UV grid through `Shape::eval_parameterization`,
+meshes on a UV grid when a rasterised overlap test shows their UV map to
+be unique (e.g. `rectangle`, which is a 4-vertex mesh in Mitsuba), and at
+their vertices otherwise (Mitsuba's `cube` and many imported models map
+several faces onto the same UV region, which a texture cannot represent;
+`mesh_mode` overrides the choice). Note that Mitsuba assigns a *black* BSDF
+to a shape that has an emitter but no BSDF, so a `thermal` shape without a
+BSDF renders as a blackbody (ε = 1). The vertex
+density of a mesh therefore sets its thermal resolution. For every 5-minute step with the sun above the horizon a shadow
 ray is cast from each element towards the sun (`Scene::ray_test`,
 vectorised); elements facing away or occluded receive no direct
 irradiance. The sky-view factor F_sky is the cosine-weighted fraction of
@@ -816,10 +823,12 @@ in ≈ 5 s on 12 cores (`examples/ir/10_thermal_solver.py`).
 #### 6.8.2 Output
 
 `ThermalResult.temperature(key, t)` returns the surface temperature field
-of a shape at an output time; `texture(key, t)` wraps it as a raw float
-bitmap texture; `apply(scene_dict, t)` returns a copy of the scene in which
-each simulated shape carries a `thermal` emitter with that texture, ready
-for `path_ir`/`volpath_ir` (Section 7.2, example 10). Example 10 shows the
+of a shape at an output time; `texture(key, t)` wraps a UV-sampled field as
+a raw float bitmap texture; `write_mesh(key, t, file)` exports a
+vertex-sampled mesh to PLY (world coordinates) with a `vertex_temperature`
+attribute; `apply(scene_dict, t)` returns a copy of the scene in which each
+simulated shape carries a `thermal` emitter with its texture or mesh
+attribute, ready for `path_ir`/`volpath_ir` (Section 7.2, example 10). Example 10 shows the
 expected behaviour for Stockholm on 15 July: open asphalt 16 °C at 05:00 →
 49 °C at 14:00 → 22 °C at 23:00 (air 14–26 °C), asphalt 0.8 m west of a
 wall shaded in the morning lagging the open ground by 16 K at 11:00 and

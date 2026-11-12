@@ -134,6 +134,7 @@ def test06_thermal_scene_shadows_and_textures(variants_vec_backends_once_spectra
     }
     ts = th.ThermalScene(scene, w, {'ground': th.MATERIALS['asphalt'], 'roof': th.MATERIALS['steel_sheet_painted']},
                          resolution=32, up=(0, 1, 0), north=(0, 0, -1), sky_rays=32)
+    assert ts.shapes['ground'].mode == 'uv'        # rectangle: a mesh with a unique UV map
     F = ts.shapes['ground'].F_sky
     assert F.min() < 0.3 and F.max() > 0.98        # under the roof vs. open ground
     assert ts.shapes['roof'].F_sky.min() > 0.98
@@ -158,3 +159,43 @@ def test06_thermal_scene_shadows_and_textures(variants_vec_backends_once_spectra
     # Asphalt (eps 0.92 - diffuse 0.08 reflectance of a black sky) near the sampled corner temperature
     T_corner = res.temperature('ground', 15)[31, 31]
     assert abs(T_app - 0.98 * T_corner) < 8.0
+
+
+def test07_mesh_vertices_and_ply_export(variants_vec_backends_once_spectral, tmp_path):
+    from mitsuba.ir import thermal as th
+    from mitsuba import ir
+    w = th.Weather('2026-07-15', 45.0, 0.0, utc_offset=0, T_min=th.celsius(15), T_max=th.celsius(25),
+                   cloud_cover=0.0, aod500=0.1)
+    scene = {
+        'type': 'scene',
+        'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(20)},
+        # Note: a shape with an emitter and *no* BSDF gets a black BSDF in Mitsuba
+        # (emissivity 1); give it an explicit one
+        'box': {'type': 'cube', 'to_world': mi.ScalarTransform4f().translate([0, 1, 0]),
+                'bsdf': {'type': 'diffuse', 'reflectance': 0.5}},
+    }
+    ts = th.ThermalScene(scene, w, {'box': th.MATERIALS['steel_sheet_insulated']},
+                         up=(0, 1, 0), north=(0, 0, -1), sky_rays=32)
+    sh = ts.shapes['box']
+    assert sh.mode == 'vertex' and sh.E == 24                # cube: overlapping UVs -> vertices (24 split vertices)
+    assert ts.shapes['box'].mode == 'vertex'
+    res = ts.run(days=2, dt=600.0, output_times=[12.0])
+    T = res.temperature('box', 12.0)
+    n = sh.n
+    top = T[n[:, 1] > 0.5].mean()
+    bottom = T[n[:, 1] < -0.5].mean()
+    north_face = T[n[:, 2] < -0.5].mean()                    # faces away from the sun (north = -z)
+    south_face = T[n[:, 2] > 0.5].mean()
+    assert top > south_face > north_face                      # sun from the south at noon, high in the sky
+    assert bottom < south_face
+    d = res.apply(scene, 12.0, mesh_dir=str(tmp_path))
+    assert d['box']['type'] == 'ply' and d['box']['emitter']['temperature']['type'] == 'mesh_attribute'
+    d['integrator'] = {'type': 'path_ir', 'max_depth': 2}
+    d['sensor'] = {'type': 'radiancemeter',
+                   'to_world': mi.ScalarTransform4f().look_at(origin=[0, 6, 0], target=[0, 1, 0], up=[0, 0, 1]),
+                   'sampler': {'type': 'independent', 'sample_count': 8},
+                   'film': ir.band_film((9990.0, 10010.0), 1, 1, rfilter='box')}
+    L = float(np.array(mi.render(mi.load_dict(d), spp=8)).ravel()[0])
+    T_app = ir.apparent_temperature(L, 9990.0, 10010.0)
+    # top face: diffuse reflectance 0.5 -> emissivity 0.5 -> 0.5 B(T_top)
+    assert abs(T_app - ir.apparent_temperature(0.5 * ir.band_radiance(9990.0, 10010.0, top), 9990.0, 10010.0)) < 1.0

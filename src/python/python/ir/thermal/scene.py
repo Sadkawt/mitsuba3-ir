@@ -11,6 +11,10 @@ from . import solar as _solar
 from .heat import Column, Material, SIGMA_SB
 
 
+import contextlib as _contextlib
+_nullcontext = _contextlib.nullcontext
+
+
 def _copy_tree(node):
     if isinstance(node, dict):
         return {k: _copy_tree(v) for k, v in node.items()}
@@ -24,15 +28,82 @@ def _as_numpy(arr):
     return a
 
 
-class _ShapeElements:
-    """Surface sample points of one shape (UV grid or vertices)."""
+def _mesh_has_unique_uvs(mesh, grid=128, max_faces=200000, max_overlap=0.02):
+    """
+    True when the mesh has texture coordinates that map its faces onto
+    disjoint regions of UV space (rasterised overlap test), so that a UV
+    texture can represent a per-point quantity. Mitsuba's ``cube`` (all
+    faces on the same square) and dense models without an unwrap return False.
+    """
+    import mitsuba as mi
+    import drjit as dr
+    nf = mesh.face_count()
+    nv = mesh.vertex_count()
+    if nf == 0 or nf > max_faces:
+        return False
+    uv = _as_numpy(mesh.vertex_texcoord(dr.arange(mi.UInt32, nv))).reshape(2, -1).T
+    if not np.any(uv != 0.0):
+        return False
+    fi = _as_numpy(mesh.face_indices(dr.arange(mi.UInt32, nf))).reshape(3, -1).T
+    cover = np.zeros((grid, grid), dtype=np.int32)
+    tri = uv[fi] * grid                                   # (F, 3, 2) in pixel units
+    for a, b, c in tri:
+        lo = np.floor(np.minimum(np.minimum(a, b), c)).astype(int)
+        hi = np.ceil(np.maximum(np.maximum(a, b), c)).astype(int)
+        lo = np.clip(lo, 0, grid - 1)
+        hi = np.clip(hi, 0, grid - 1)
+        if np.any(hi < lo):
+            continue
+        xs = np.arange(lo[0], hi[0] + 1) + 0.5
+        ys = np.arange(lo[1], hi[1] + 1) + 0.5
+        X, Y = np.meshgrid(xs, ys)
+        d = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+        if abs(d) < 1e-12:
+            continue
+        w0 = ((b[0] - X) * (c[1] - Y) - (c[0] - X) * (b[1] - Y)) / d
+        w1 = ((c[0] - X) * (a[1] - Y) - (a[0] - X) * (c[1] - Y)) / d
+        w2 = 1.0 - w0 - w1
+        inside = (w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)
+        cover[lo[1]:hi[1] + 1, lo[0]:hi[0] + 1] += inside.astype(np.int32)
+    covered = cover >= 1
+    if not covered.any():
+        return False
+    overlap = np.count_nonzero(cover >= 2) / np.count_nonzero(covered)
+    return overlap <= max_overlap
 
-    def __init__(self, key, shape, material, resolution):
-        import mitsuba as mi
-        import drjit as dr
+
+class _ShapeElements:
+    """
+    Surface sample points of one shape.
+
+    * Analytic shapes (rectangle, sphere, disk, cylinder) and meshes with
+      ``mesh_mode='uv'`` are sampled on a UV grid; the result is a bitmap
+      temperature texture.
+    * Meshes without a unique UV unwrap (``mesh_mode='auto'`` decides with a
+      rasterised overlap test; Mitsuba's built-in ``cube`` and many imported
+      models map several faces onto the same UV region) are sampled at their
+      vertices. The result is a per-vertex temperature attribute, exported
+      with the mesh to PLY by :meth:`ThermalResult.apply`. The vertex density
+      of the mesh then sets the thermal resolution.
+    """
+
+    def __init__(self, key, shape, material, resolution, mesh_mode='auto'):
         self.key = key
         self.shape = shape
         self.material = material
+        is_mesh = hasattr(shape, 'vertex_count')
+        if is_mesh and mesh_mode == 'auto':
+            mesh_mode = 'uv' if _mesh_has_unique_uvs(shape) else 'vertex'
+        if is_mesh and mesh_mode == 'vertex':
+            self._init_vertices(shape)
+        else:
+            self._init_uv(shape, resolution)
+        self.E = int(self.valid.sum())
+        self.idx = np.where(self.valid)[0]
+
+    def _init_uv(self, shape, resolution):
+        import mitsuba as mi
+        import drjit as dr
         self.mode = 'uv'
         res = (resolution, resolution) if np.isscalar(resolution) else tuple(resolution)
         self.res = res
@@ -40,46 +111,43 @@ class _ShapeElements:
         u = (np.arange(W) + 0.5) / W
         v = (np.arange(H) + 0.5) / H
         uu, vv = np.meshgrid(u, v)
-        try:
-            uv = mi.Point2f(mi.Float(uu.ravel()), mi.Float(vv.ravel()))
-            si = shape.eval_parameterization(uv, +mi.RayFlags.Default, dr.full(mi.Bool, True, H * W))
-            valid = _as_numpy(si.is_valid()).ravel()
-            if valid.size == 1:
-                valid = np.full(H * W, bool(valid[0]))
-            p = _as_numpy(si.p).reshape(3, -1).T
-            n = _as_numpy(si.n).reshape(3, -1).T
-            # Constant quantities (e.g. the normal of a flat rectangle) come
-            # back as width-1 literals: broadcast them
-            if p.shape[0] == 1 and H * W > 1:
-                p = np.broadcast_to(p, (H * W, 3)).copy()
-            if n.shape[0] == 1 and H * W > 1:
-                n = np.broadcast_to(n, (H * W, 3)).copy()
-            if not valid.all():
-                # Meshes with partial UV coverage: keep valid texels only
-                pass
-            self.valid = valid
-            self.p = p
-            self.n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
-        except Exception:
-            # Fallback: vertices of a mesh without UVs
-            if not hasattr(shape, 'vertex_positions_buffer'):
-                raise
-            self.mode = 'vertex'
-            vp = _as_numpy(shape.vertex_positions_buffer()).reshape(-1, 3)
-            if shape.has_vertex_normals():
-                vn = _as_numpy(shape.vertex_normals_buffer()).reshape(-1, 3)
-            else:
-                faces = _as_numpy(shape.faces_buffer()).reshape(-1, 3)
-                vn = np.zeros_like(vp)
-                fn = np.cross(vp[faces[:, 1]] - vp[faces[:, 0]], vp[faces[:, 2]] - vp[faces[:, 0]])
-                for j in range(3):
-                    np.add.at(vn, faces[:, j], fn)
-            self.p = vp
-            self.n = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
-            self.valid = np.ones(len(vp), dtype=bool)
-            self.res = (len(vp), 1)
-        self.E = int(self.valid.sum())
-        self.idx = np.where(self.valid)[0]
+        uv = mi.Point2f(mi.Float(uu.ravel()), mi.Float(vv.ravel()))
+        si = shape.eval_parameterization(uv, +mi.RayFlags.Default, dr.full(mi.Bool, True, H * W))
+        valid = _as_numpy(si.is_valid()).ravel()
+        if valid.size == 1:
+            valid = np.full(H * W, bool(valid[0]))
+        p = _as_numpy(si.p).reshape(3, -1).T
+        n = _as_numpy(si.n).reshape(3, -1).T
+        # Constant quantities (e.g. the normal of a flat rectangle) come
+        # back as width-1 literals: broadcast them
+        if p.shape[0] == 1 and H * W > 1:
+            p = np.broadcast_to(p, (H * W, 3)).copy()
+        if n.shape[0] == 1 and H * W > 1:
+            n = np.broadcast_to(n, (H * W, 3)).copy()
+        self.valid = valid
+        self.p = p
+        self.n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+
+    def _init_vertices(self, shape):
+        import mitsuba as mi
+        import drjit as dr
+        self.mode = 'vertex'
+        nv = shape.vertex_count()
+        idx = dr.arange(mi.UInt32, nv)
+        vp = _as_numpy(shape.vertex_position(idx)).reshape(3, -1).T
+        vn = _as_numpy(shape.vertex_normal(idx)).reshape(3, -1).T
+        if not np.all(np.isfinite(vn)) or np.any(np.linalg.norm(vn, axis=1) < 0.5):
+            # Area-weighted normals from the faces
+            nf = shape.face_count()
+            fi = _as_numpy(shape.face_indices(dr.arange(mi.UInt32, nf))).reshape(3, -1).T
+            fn = np.cross(vp[fi[:, 1]] - vp[fi[:, 0]], vp[fi[:, 2]] - vp[fi[:, 0]])
+            vn = np.zeros_like(vp)
+            for j in range(3):
+                np.add.at(vn, fi[:, j], fn)
+        self.p = vp
+        self.n = vn / np.maximum(np.linalg.norm(vn, axis=1, keepdims=True), 1e-12)
+        self.valid = np.ones(nv, dtype=bool)
+        self.res = (nv, 1)
 
 
 class ThermalResult:
@@ -117,42 +185,70 @@ class ThermalResult:
         return T
 
     def texture(self, key, t, fill=None):
-        """Mitsuba texture dictionary holding the temperature field of a shape [K]."""
+        """Mitsuba texture dictionary holding the temperature field of a UV-sampled shape [K]."""
         import mitsuba as mi
         sh = self._shapes[key]
+        if sh.mode != 'uv':
+            raise ValueError(f"shape '{key}' is sampled per vertex; use apply() or write_mesh()")
         T = self.temperature(key, t)
-        if sh.mode == 'uv':
-            if fill is None:
-                fill = float(np.nanmean(T))
-            T = np.where(np.isfinite(T), T, fill).astype(np.float32)
-            return {'type': 'bitmap', 'bitmap': mi.Bitmap(np.ascontiguousarray(T[..., None])),
-                    'raw': True, 'filter_type': 'bilinear', 'wrap_mode': 'clamp'}
-        # Vertex mode: attach a mesh attribute
-        sh.shape.add_attribute('vertex_temperature', 1, mi.Float(T.astype(np.float32)))
-        return {'type': 'mesh_attribute', 'name': 'vertex_temperature'}
+        if fill is None:
+            fill = float(np.nanmean(T))
+        T = np.where(np.isfinite(T), T, fill).astype(np.float32)
+        return {'type': 'bitmap', 'bitmap': mi.Bitmap(np.ascontiguousarray(T[..., None])),
+                'raw': True, 'filter_type': 'bilinear', 'wrap_mode': 'clamp'}
 
-    def apply(self, scene_dict, t, twosided=True, default_temperature=None):
+    def write_mesh(self, key, t, filename):
+        """
+        Write a vertex-sampled mesh to PLY (world coordinates) with its
+        temperature as the vertex attribute ``vertex_temperature``.
+        """
+        import mitsuba as mi
+        sh = self._shapes[key]
+        if sh.mode != 'vertex':
+            raise ValueError(f"shape '{key}' is sampled on a UV grid; use texture()")
+        T = self.temperature(key, t).astype(np.float32)
+        mesh = sh.shape
+        if mesh.has_attribute('vertex_temperature'):
+            mesh.remove_attribute('vertex_temperature')
+        mesh.add_attribute('vertex_temperature', mi.TensorXf(T.reshape(-1, 1)))
+        with mi.ScopedSetLogLevel(mi.LogLevel.Error) if hasattr(mi, 'ScopedSetLogLevel') else _nullcontext():
+            mesh.write_ply(str(filename))
+        return str(filename)
+
+    def apply(self, scene_dict, t, twosided=True, default_temperature=None, mesh_dir=None):
         """
         Copy of ``scene_dict`` in which every simulated shape carries a
-        ``thermal`` emitter with its temperature texture at time ``t``.
-        Shapes that were not simulated get ``default_temperature`` (K) if
-        given (e.g. the air temperature), otherwise they are left untouched.
+        ``thermal`` emitter with its temperature field at time ``t``:
+        UV-sampled shapes get a bitmap texture; vertex-sampled meshes are
+        written to ``mesh_dir`` (default: a temporary directory) as PLY files
+        in world coordinates with a ``vertex_temperature`` attribute and
+        referenced from the dictionary. Shapes that were not simulated get
+        ``default_temperature`` (K) if given, otherwise they are left untouched.
         """
+        import os
+        import tempfile
         out = _copy_tree(scene_dict)
         for key in self.keys():
             node = out.get(key)
             if node is None:
                 continue
-            if self._shapes[key].mode == 'vertex':
-                # The mesh attribute lives on the loaded shape; the dictionary
-                # scene must reference the same mesh, so we store the array
-                # for the caller instead of a texture (see mesh_attribute docs)
+            sh = self._shapes[key]
+            if sh.mode == 'vertex':
+                if mesh_dir is None:
+                    mesh_dir = tempfile.mkdtemp(prefix='mitsuba_ir_thermal_')
+                os.makedirs(mesh_dir, exist_ok=True)
+                tag = f'{t:05.2f}'.replace('.', '_') if not isinstance(t, str) else t.replace(':', '_')
+                path = os.path.join(mesh_dir, f'{key}_{tag}.ply')
+                self.write_mesh(key, t, path)
+                new_node = {k: v for k, v in node.items() if k not in ('type', 'to_world', 'filename',
+                                                                      'face_normals', 'flip_normals')}
+                new_node.update({'type': 'ply', 'filename': path})
+                new_node['emitter'] = {'type': 'thermal', 'twosided': twosided,
+                                       'temperature': {'type': 'mesh_attribute', 'name': 'vertex_temperature'}}
+                out[key] = new_node
+            else:
                 node['emitter'] = {'type': 'thermal', 'twosided': twosided,
-                                   'temperature': float(np.nanmean(self.temperature(key, t)))}
-                node['_vertex_temperature'] = self.temperature(key, t)
-                continue
-            node['emitter'] = {'type': 'thermal', 'twosided': twosided,
-                               'temperature': self.texture(key, t)}
+                                   'temperature': self.texture(key, t)}
         if default_temperature is not None:
             from ..scene import thermalize
             out = thermalize(out, temperature=float(default_temperature), twosided=twosided, in_place=True)
@@ -177,7 +273,11 @@ class ThermalScene:
         ``{shape_key: Material}``; shapes not listed are not simulated but
         still cast shadows.
     resolution : int or dict
-        Samples per UV axis (default 64), optionally per shape key.
+        Samples per UV axis for UV-sampled shapes (default 64), optionally
+        per shape key. Meshes are sampled per vertex unless ``mesh_mode='uv'``.
+    mesh_mode : 'auto' (default), 'uv' or 'vertex'
+        How meshes are sampled: 'auto' uses a UV grid when the mesh has a
+        unique UV unwrap (rasterised overlap test) and vertices otherwise.
     up, north : world-space zenith and geographic north directions.
     sky_rays : hemisphere rays per element for the sky-view factor.
     T_surroundings : temperature of the unresolved surroundings seen by an
@@ -185,7 +285,7 @@ class ThermalScene:
     """
 
     def __init__(self, scene_dict, weather, materials, resolution=64, up=(0, 0, 1),
-                 north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0):
+                 north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto'):
         import mitsuba as mi
         self.weather = weather
         self.up = np.asarray(up, dtype=np.float64) / np.linalg.norm(up)
@@ -199,7 +299,7 @@ class ThermalScene:
             if key not in ids:
                 raise KeyError(f"shape '{key}' not found in the scene (ids: {sorted(ids)})")
             res = resolution.get(key, 64) if isinstance(resolution, dict) else resolution
-            self.shapes[key] = _ShapeElements(key, ids[key], mat, res)
+            self.shapes[key] = _ShapeElements(key, ids[key], mat, res, mesh_mode=mesh_mode)
         bbox = self.scene.bbox()
         self.eps = 1e-4 * float(np.linalg.norm(np.array(bbox.max) - np.array(bbox.min)))
         self._rng = np.random.default_rng(seed)
