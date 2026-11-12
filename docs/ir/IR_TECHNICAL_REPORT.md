@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.3 — Phase 3 (emissive atmosphere: media, sky, HITRAN transmittance) |
+| **Version** | 0.3.1 — Phase 3 (emissive atmosphere: media, sky, HITRAN transmittance + continuum) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -675,25 +675,35 @@ aerosol are not modelled.
 
 ### 6.7 Molecular transmittance from HITRAN
 
-> **A16 — Line-by-line molecular absorption (H₂O, CO₂, …) from HITRAN,
-> without continuum or aerosols.** `mitsuba.ir.hitran_absorption` computes
-> σ_a(λ) of humid air with the HITRAN Application Programming Interface
-> [51] (Voigt profiles, ±25 cm⁻¹ line wings, TIPS partition sums), for use
-> as the extinction of an `air_medium` and as the transmittance of the
-> `sun`.
+> **A16 — Line-by-line molecular absorption (H₂O, CO₂, …) from HITRAN plus
+> the empirical Roberts–Selby–Biberman water-vapour continuum; no aerosols,
+> no O₃.** `mitsuba.ir.hitran_absorption` computes σ_a(λ) of humid air with
+> the HITRAN Application Programming Interface [51] (Voigt profiles, ±25
+> cm⁻¹ line wings, TIPS partition sums, 0.05 cm⁻¹ grid) and adds, for
+> 8–14 µm, the continuum of Roberts et al. (1976) [55]: k = C_s(ν,T) ρ_w
+> (e + 0.002 (P − e)), C_s = [4.18 + 5578 e^{−0.00787 ν}] e^{1800(1/T − 1/296)}
+> cm² g⁻¹ atm⁻¹. Both feed `air_medium` and the `sun` transmittance.
 
-*Motivation.* HITRAN [35] is the reference spectroscopic database; `hapi`
-is its official line-by-line tool and reproduces the band structure that
-dominates MWIR/LWIR transmission (CO₂ at 4.3 µm: τ(1 km) = 0.04; 3.5–4.1 µm:
-0.998; H₂O lines in the LWIR: 0.85 band-averaged over 1 km at RH 50 %).
-**Limitation stated to the user:** the water-vapour *continuum* (MT_CKD,
-Mlawer et al. 2012 [52]) is not part of HITRAN line lists and is the
-dominant absorber in the 8–13 µm window at high humidity; aerosol
-extinction is absent too. Window transmittances are therefore upper
-bounds (0.97 over 1 km at 10–12 µm here, where MODTRAN mid-latitude summer
-gives ≈ 0.8). For radiometric accuracy at long ranges a MODTRAN-type
-transmittance table should be passed to `air_medium`/`sun`; the plumbing is
-identical.
+*Motivation.* HITRAN [35] is the reference spectroscopic database and
+`hapi` its official line-by-line tool. Lines alone reproduce the band
+structure that bounds the atmospheric windows — for a 1 km sea-level path
+at 288 K, RH 50 % (6.4 g m⁻³): τ = 0.02 at 6.5–7.0 µm and 0.53 at 7.5–8.0 µm
+(the H₂O ν₂ wing that forms the short-wave edge of the LWIR window), 0.94
+across 9–13 µm, 0.32 at 13.5–14 µm and 0 beyond 14.5 µm (CO₂ ν₂ band); in
+the MWIR τ = 0.04 in the CO₂ ν₃ band at 4.2–4.4 µm and 0.998 at 3.5–4.1 µm.
+What lines do *not* give is the smooth absorption of the window itself: the
+water-vapour continuum, which scales with e_a² and rises towards 13 µm. The
+RSB fit [55] (the LOWTRAN continuum) supplies it with ≈ 20 % accuracy —
+0.035, 0.049 and 0.095 km⁻¹ at 8, 10 and 12 µm for the conditions above,
+lowering the 9–13 µm transmittance from 0.94 to 0.88 — and was chosen over
+MT_CKD [52] because its closed form needs no external tables; MT_CKD is the
+modern reference and a user-supplied σ_a(λ) table replaces the fit
+transparently. Grid-step check: 0.25 → 0.02 cm⁻¹ changes 1 km band averages
+by < 0.2 %, so 0.05 cm⁻¹ is adequate. **Not included:** aerosol extinction,
+ozone (9.6 µm, minor for horizontal sea-level paths), CH₄/N₂O beyond their
+fixed mixing ratios, and any vertical structure; slant paths through the
+whole atmosphere require a layered model (MODTRAN-type), whose output can be
+passed to `air_medium`/`sun`.
 
 ---
 
@@ -729,7 +739,7 @@ identical.
 | `06_ecostress.py` | Measured reflectance spectra as Lambertian IR materials | Rendered radiance equals ε_band·B to 0.07 % |
 | `07_atmosphere.py` | `volpath_ir` with an emissive air layer of 10 m–10 km in front of a 350 K plate (gray or `--hitran` absorption) | Matches τ L_up + (1−τ) B_air (hemispherical slab term for L_down) to < 0.3 % at short range, ≤ 2 % at 10 km (Monte Carlo noise, 1024 spp) |
 | `08_sky.py` | `thermalsky` angular radiance; polished Al plate mirroring the sky | Sky 245 K (zenith) → 293 K (horizon); 300 K Al plate reads 245–293 K depending on tilt |
-| `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km in MWIR/LWIR; attenuated sun and air medium | CO₂ band opaque, 3.5–4.1 µm clear |
+| `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km, 2.5–5.5 and 6.5–15.5 µm, with/without RSB continuum; attenuated sun and air medium | Window edges at 7.5–8 µm (H₂O) and 13.5–14 µm (CO₂), CO₂ 4.3 µm band opaque, continuum slope in the window |
 
 ---
 
@@ -826,8 +836,9 @@ Known limitations of the present state:
   soils and fabrics must come from spectral libraries (Section 6.3) or user
   measurements. Only hemispherical (Lambertian) use of library data is
   supported; measured BRDFs are not.
-* Atmosphere: no water-vapour continuum, no aerosols, no clouds (A15, A16);
-  the sky is an isothermal slab at the screen-level air temperature.
+* Atmosphere: legacy RSB continuum instead of MT_CKD, no aerosols, no O₃,
+  no clouds, horizontal homogeneous paths only (A15, A16); the sky is an
+  isothermal slab at the screen-level air temperature.
 * Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
 
 ---
@@ -942,12 +953,15 @@ Known limitations of the present state:
 
 [54] World Meteorological Organization, *Guide to Meteorological Instruments and Methods of Observation*, WMO-No. 8, 2008 (Magnus-type saturation vapour pressure formula).
 
+[55] R. E. Roberts, J. E. A. Selby, L. M. Biberman, "Infrared continuum absorption by atmospheric water vapor in the 8–12-µm window," *Applied Optics* 15(9), 2085–2090, 1976.
+
 ---
 
 ## Appendix A — Changelog
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-12 | 0.3.1 | Atmosphere: RSB water-vapour continuum added to `hitran_absorption` (default on), grid step 0.05 cm⁻¹, example 09 extended beyond the band edges; A16 and §6.7 revised after review of the transmittance figure. |
 | 2026-11-12 | 0.3 | Phase 3: medium `temperature`, `volpath_ir` (difference formulation for emissive media), `thermalsky` emitter, `mitsuba.ir.atmosphere` (Idso emissivity, air media, HITRAN line-by-line via hapi), 14 new tests, examples 07–09, assumptions A14–A16, references [51]–[54]. |
 | 2026-11-12 | 0.2 | Phase 2: `*_ir` optical constants (22 presets, Lorentz–Drude metals verified to 1.3·10⁻⁴ against [43]; dielectrics/water from [43]), `mitsuba.ir` package (radiometry, materials, scene helpers), 13 new tests, `examples/ir/` (6 scripts), assumptions A9–A13, convergence study. |
 | 2026-11-12 | 0.1 | Phase 1: `EmitterFlags::Thermal`, `Integrator::thermal_aware()`, `thermal` emitter, `path_ir` integrator, scene-level compatibility warning, unit and validation tests, this report. |

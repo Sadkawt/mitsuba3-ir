@@ -33,7 +33,7 @@ from .materials import (
 from .scene import thermalize, validate, sun, sky_blackbody
 from .atmosphere import (
     sky_emissivity_idso, thermalsky, air_medium, medium_box, hitran_absorption,
-    transmittance, vapour_pressure,
+    transmittance, vapour_pressure, rsb_continuum,
 )
 
 __all__ = [
@@ -46,5 +46,5 @@ __all__ = [
     'IR_MATERIALS',
     'thermalize', 'validate', 'sun', 'sky_blackbody',
     'sky_emissivity_idso', 'thermalsky', 'air_medium', 'medium_box', 'hitran_absorption',
-    'transmittance', 'vapour_pressure',
+    'transmittance', 'vapour_pressure', 'rsb_continuum',
 ]

@@ -179,3 +179,26 @@ Number of X Values: 4
     bsdf_dict = ir.diffuse_from_emissivity(lam, 1.0 - refl)
     bsdf = mi.load_dict(bsdf_dict)
     assert bsdf is not None
+
+
+def test10_atmosphere_helpers(variant_scalar_spectral):
+    from mitsuba import ir
+    # Idso (1981) clear-sky emissivities: full spectrum ~0.8, window ~0.3-0.5
+    e_a = ir.vapour_pressure(293.15, 0.6)
+    assert 13.0 < e_a < 15.0                      # Magnus: 14.0 hPa
+    assert 0.78 < ir.sky_emissivity_idso(293.15, e_a) < 0.88
+    assert 0.3 < ir.sky_emissivity_idso(293.15, e_a, '8-14') < 0.5
+    assert ir.sky_emissivity_idso(293.15, e_a, '10.5-12.5') < ir.sky_emissivity_idso(293.15, e_a, '8-14')
+    # RSB continuum: a few 1e-2 per km in the window at 6-7 g/m^3, increasing
+    # with wavelength and quadratically with vapour pressure
+    k = ir.rsb_continuum(np.array([8000.0, 10000.0, 12000.0]), 288.15, 8.5)
+    assert np.all(np.diff(k) > 0) and 2e-5 < k[1] < 1e-4
+    # k ~ e (e + gamma (P - e)): doubling e gives x3.6 at 1 atm (x4 without the foreign term)
+    ratio = ir.rsb_continuum(10000.0, 288.15, 17.0) / ir.rsb_continuum(10000.0, 288.15, 8.5)
+    assert 3.5 < ratio < 4.0
+    # thermalsky / air_medium dictionaries load
+    sky = mi.load_dict(ir.thermalsky(290.0, relative_humidity=0.5))
+    assert sky is not None
+    med = mi.load_dict(ir.air_medium(288.15, ([8000.0, 10000.0, 14000.0], [1e-4, 2e-4, 5e-4])))
+    assert med.is_thermal()
+    ir.transmittance(([1.0, 2.0], [0.1, 0.2]), 10.0)

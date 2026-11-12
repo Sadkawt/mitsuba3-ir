@@ -130,12 +130,45 @@ def medium_box(medium_ref, p_min, p_max):
 
 
 # ---------------------------------------------------------------------------
+# Water vapour continuum (empirical, 8-13 um window)
+# ---------------------------------------------------------------------------
+
+def rsb_continuum(lambda_nm, T_air=288.15, e_hPa=8.5, pressure_hPa=1013.25):
+    """
+    Water-vapour continuum absorption coefficient [1/m] in the 8-13 um
+    window after Roberts, Selby & Biberman (1976), Appl. Opt. 15, 2085-2090
+    (the LOWTRAN 3-5 continuum):
+
+        k(nu) = C_s(nu, T) * rho_w * (e + gamma (P - e)),
+        C_s(nu, T) = [a + b exp(-beta nu)] exp[T0 (1/T - 1/296)],
+
+    with a = 4.18, b = 5578 cm^2 g^-1 atm^-1, beta = 7.87e-3 cm,
+    T0 = 1800 K, gamma = 0.002 (foreign-to-self broadening ratio), rho_w the
+    absolute humidity [g cm^-3], e the vapour pressure and P the total
+    pressure [atm], nu in cm^-1. The fit is valid for 700-1250 cm^-1
+    (8-14 um); outside that range the result is held at the boundary value
+    and should not be trusted. The model has been superseded by MT_CKD
+    (Mlawer et al. 2012) but reproduces the e_a^2-scaled, red-sloping window
+    continuum to within ~20 % for typical conditions.
+    """
+    lam = np.asarray(lambda_nm, dtype=np.float64)
+    nu = np.clip(1e7 / lam, 700.0, 1250.0)
+    T = float(T_air)
+    e_atm = float(e_hPa) / 1013.25
+    P_atm = float(pressure_hPa) / 1013.25
+    rho_w = float(e_hPa) * 100.0 / (461.5 * T) * 1e-3     # kg m^-3 -> g cm^-3 (x1e3 g/kg x1e-6 m^3/cm^3)
+    C_s = (4.18 + 5578.0 * np.exp(-7.87e-3 * nu)) * np.exp(1800.0 * (1.0 / T - 1.0 / 296.0))
+    k_cm = C_s * rho_w * (e_atm + 0.002 * (P_atm - e_atm))  # cm^-1
+    return k_cm * 100.0                                      # m^-1
+
+
+# ---------------------------------------------------------------------------
 # HITRAN line-by-line absorption (optional dependency: hitran-api / hapi)
 # ---------------------------------------------------------------------------
 
 def hitran_absorption(band, T_air=288.15, pressure_hPa=1013.25, relative_humidity=0.5,
-                      molecules=('H2O', 'CO2'), resolution_cm=0.1, line_profile='Voigt',
-                      db_dir='hitran_db', vmr=None, verbose=False):
+                      molecules=('H2O', 'CO2'), resolution_cm=0.05, line_profile='Voigt',
+                      db_dir='hitran_db', vmr=None, continuum='rsb', verbose=False):
     """
     Molecular absorption coefficient sigma_a(lambda) [1/m] of air at sea
     level from HITRAN line-by-line data, via the HITRAN Application
@@ -148,22 +181,27 @@ def hitran_absorption(band, T_air=288.15, pressure_hPa=1013.25, relative_humidit
     band : str or (lmin, lmax) in nm
     T_air, pressure_hPa, relative_humidity : ambient conditions
     molecules : HITRAN molecules to include (main isotopologues)
-    resolution_cm : wavenumber grid step [cm^-1]
+    resolution_cm : wavenumber grid step [cm^-1]. 0.05 resolves the ~0.07
+          cm^-1 pressure-broadened half-width at 1 atm; band averages over
+          a 1 km path change by < 0.2 % between 0.25 and 0.02.
     line_profile : 'Voigt' (default), 'Lorentz' or 'HT'
     vmr : dict of volume mixing ratios overriding :data:`DRY_AIR_VMR`
           (H2O is always taken from the humidity)
+    continuum : 'rsb' (default) adds the empirical water-vapour continuum of
+          Roberts, Selby & Biberman (1976) for wavelengths in 8-14 um
+          (:func:`rsb_continuum`); None gives line absorption only.
 
     Returns
     -------
     (wavelengths_nm, sigma_a_per_m) sorted by increasing wavelength.
 
-    **Limitations stated in the report (assumption A15):** only line
-    absorption within +-25 cm^-1 of each line is included; the water vapour
-    *continuum* (MT_CKD; Mlawer et al. 2012), which dominates the 8-13 um
-    window at high humidity, and aerosol extinction are not. The
-    transmittance of the LWIR window is therefore overestimated; use a
-    MODTRAN-type code for those cases and pass its result to
-    :func:`air_medium` / :func:`mitsuba.ir.sun`.
+    **Limitations stated in the report (assumption A16):** line absorption
+    is included within +-25 cm^-1 of each line; the water-vapour continuum
+    is the legacy RSB fit (valid 8-14 um, ~20 % accuracy) rather than
+    MT_CKD (Mlawer et al. 2012); aerosol extinction, O3 and the minor gases
+    beyond those in :data:`DRY_AIR_VMR` are not included. For radiometric
+    work at long range, pass a MODTRAN-type table to :func:`air_medium` /
+    :func:`mitsuba.ir.sun` instead.
     """
     try:
         import hapi
@@ -218,6 +256,11 @@ def hitran_absorption(band, T_air=288.15, pressure_hPa=1013.25, relative_humidit
         raise ValueError("no molecule with non-zero mixing ratio")
     lam_nm = 1e7 / nu_grid
     sigma_m = total * 100.0              # cm^-1 -> m^-1
+    if continuum == 'rsb':
+        in_window = (lam_nm >= 8000.0) & (lam_nm <= 14000.0)
+        sigma_m = sigma_m + np.where(in_window, rsb_continuum(lam_nm, T_air, e_a, pressure_hPa), 0.0)
+    elif continuum is not None:
+        raise ValueError("continuum must be 'rsb' or None")
     order = np.argsort(lam_nm)
     return lam_nm[order], sigma_m[order]
 
