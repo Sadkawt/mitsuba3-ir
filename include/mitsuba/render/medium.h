@@ -11,7 +11,7 @@ NAMESPACE_BEGIN(mitsuba)
 template <typename Float, typename Spectrum>
 class MI_EXPORT_LIB Medium : public JitObject<Medium<Float, Spectrum>> {
 public:
-    MI_IMPORT_TYPES(PhaseFunction, Sampler, Scene, Texture);
+    MI_IMPORT_TYPES(PhaseFunction, Sampler, Scene, Texture, Volume);
 
     /// Destructor
     ~Medium();
@@ -85,6 +85,18 @@ public:
     /// Returns whether this specific medium instance uses emitter sampling
     MI_INLINE bool use_emitter_sampling() const { return m_sample_emitters; }
 
+    /**
+     * \brief Absolute temperature of the medium (kelvin) at ``mi``
+     *
+     * Thermal-aware integrators (``volpath_ir``) use it for the thermal
+     * self-emission of the medium, sigma_a * B(lambda, T). The default is
+     * 0 K (no emission).
+     */
+    Float temperature(const MediumInteraction3f &mi, Mask active = true) const;
+
+    /// Does this medium emit thermal radiation (non-zero temperature)?
+    MI_INLINE bool is_thermal() const { return m_is_thermal; }
+
     /// Returns whether this medium is homogeneous
     MI_INLINE bool is_homogeneous() const { return m_is_homogeneous; }
 
@@ -106,11 +118,14 @@ protected:
 
 protected:
     ref<PhaseFunction> m_phase_function;
+    /// Temperature field [K] (constant 0 by default)
+    ref<Volume> m_temperature;
     bool m_sample_emitters;
+    bool m_is_thermal;
     bool m_is_homogeneous;
     bool m_has_spectral_extinction;
 
-    MI_DECLARE_TRAVERSE_CB(m_phase_function)
+    MI_DECLARE_TRAVERSE_CB(m_phase_function, m_temperature)
 };
 
 MI_EXTERN_CLASS(Medium)
@@ -125,6 +140,8 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Medium)
     DRJIT_CALL_GETTER(use_emitter_sampling)
     DRJIT_CALL_GETTER(is_homogeneous)
     DRJIT_CALL_GETTER(has_spectral_extinction)
+    DRJIT_CALL_GETTER(is_thermal)
+    DRJIT_CALL_METHOD(temperature)
     DRJIT_CALL_METHOD(get_majorant)
     DRJIT_CALL_METHOD(intersect_aabb)
     DRJIT_CALL_METHOD(sample_interaction)

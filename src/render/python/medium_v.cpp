@@ -66,6 +66,14 @@ template <typename Ptr, typename Cls> void bind_medium_generic(Cls &cls) {
        .def("has_spectral_extinction",
             [](Ptr ptr) { return ptr->has_spectral_extinction(); },
             D(Medium, has_spectral_extinction))
+       .def("is_thermal",
+            [](Ptr ptr) { return ptr->is_thermal(); },
+            D(Medium, is_thermal))
+       .def("temperature",
+            [](Ptr ptr, const MediumInteraction3f &mi, Mask active) {
+                return ptr->temperature(mi, active); },
+            "mi"_a, "active"_a=true,
+            D(Medium, temperature))
        .def("get_majorant",
             [](Ptr ptr, const MediumInteraction3f &mi, Mask active) {
                 return ptr->get_majorant(mi, active); },

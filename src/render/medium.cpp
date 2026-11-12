@@ -4,13 +4,15 @@
 #include <mitsuba/render/phase.h>
 #include <mitsuba/render/scene.h>
 #include <mitsuba/render/texture.h>
+#include <mitsuba/render/volume.h>
 
 NAMESPACE_BEGIN(mitsuba)
 
 MI_VARIANT Medium<Float, Spectrum>::Medium()
     : JitObject<Medium>(""),
       m_is_homogeneous(false),
-      m_has_spectral_extinction(true) {
+      m_has_spectral_extinction(true),
+      m_is_thermal(false) {
 }
 
 MI_VARIANT Medium<Float, Spectrum>::Medium(const Properties &props)
@@ -29,12 +31,22 @@ MI_VARIANT Medium<Float, Spectrum>::Medium(const Properties &props)
     }
 
     m_sample_emitters = props.get<bool>("sample_emitters", true);
+
+    // Thermal self-emission (infrared extension): temperature field in kelvin
+    m_temperature = props.get_volume<Volume>("temperature", 0.f);
+    m_is_thermal = m_temperature->max() > 0.f;
 }
 
 MI_VARIANT Medium<Float, Spectrum>::~Medium() { }
 
+MI_VARIANT Float Medium<Float, Spectrum>::temperature(const MediumInteraction3f &mi,
+                                                      Mask active) const {
+    return m_temperature->eval_1(mi, active);
+}
+
 MI_VARIANT void Medium<Float, Spectrum>::traverse(TraversalCallback *cb) {
     cb->put("phase_function", m_phase_function, ParamFlags::Differentiable);
+    cb->put("temperature", m_temperature, ParamFlags::NonDifferentiable);
 }
 
 MI_VARIANT

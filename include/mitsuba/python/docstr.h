@@ -5840,6 +5840,12 @@ R"doc(Returns the medium coefficients :math:`\sigma_s`, :math:`\sigma_n` and
 
 static const char *__doc_mitsuba_Medium_has_spectral_extinction = R"doc(Returns whether this medium has a spectrally varying extinction)doc";
 
+static const char *__doc_mitsuba_Medium_is_thermal = R"doc(Does this medium emit thermal radiation (non-zero temperature)?)doc";
+
+static const char *__doc_mitsuba_Medium_temperature =
+R"doc(Absolute temperature of the medium (kelvin) at ``mi``, used by
+thermal-aware integrators for the medium self-emission sigma_a B(lambda, T).)doc";
+
 static const char *__doc_mitsuba_Medium_intersect_aabb = R"doc(Intersects a ray with the medium's bounding box)doc";
 
 static const char *__doc_mitsuba_Medium_is_homogeneous = R"doc(Returns whether this medium is homogeneous)doc";

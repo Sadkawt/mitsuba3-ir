@@ -2,6 +2,7 @@ set(MI_PLUGIN_PREFIX "emitters")
 
 add_plugin(area            area.cpp)
 add_plugin(thermal         thermal.cpp)
+add_plugin(thermalsky      thermalsky.cpp)
 add_plugin(point           point.cpp)
 add_plugin(constant        constant.cpp)
 add_plugin(envmap          envmap.cpp)

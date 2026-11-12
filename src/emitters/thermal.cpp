@@ -5,6 +5,7 @@
 #include <mitsuba/render/medium.h>
 #include <mitsuba/render/shape.h>
 #include <mitsuba/render/texture.h>
+#include <mitsuba/render/thermal.h>
 #include <drjit/traversable_base.h>
 
 NAMESPACE_BEGIN(mitsuba)
@@ -110,16 +111,6 @@ public:
     MI_IMPORT_BASE(Emitter, m_flags, m_shape, m_medium)
     MI_IMPORT_TYPES(Scene, Shape, Texture)
 
-    // Exact SI (2019) values of the physical constants
-    constexpr static double c_light = 299792458.0;     /// Speed of light [m/s]
-    constexpr static double h_planck = 6.62607015e-34; /// Planck constant [J s]
-    constexpr static double k_boltz = 1.380649e-23;    /// Boltzmann constant [J/K]
-
-    /// First radiation constant for spectral radiance, 2 h c^2 [W m^2 sr^-1]
-    constexpr static double c1L = 2.0 * h_planck * c_light * c_light;
-    /// Second radiation constant, h c / k_B [m K]
-    constexpr static double c2 = h_planck * c_light / k_boltz;
-
     ThermalEmitter(const Properties &props) : Base(props) {
         if constexpr (!is_spectral_v<Spectrum>)
             Throw("The 'thermal' emitter requires a spectral variant of "
@@ -159,21 +150,8 @@ public:
     UnpolarizedSpectrum planck(const SurfaceInteraction3f &si, Mask active) const {
         if constexpr (is_spectral_v<Spectrum>) {
             Float T = m_temperature->eval_1(si, active);
-
-            // Wavelengths are stored in nanometers; convert to meters.
-            UnpolarizedSpectrum lambda  = si.wavelengths * 1e-9f,
-                                lambda2 = dr::square(lambda),
-                                lambda5 = dr::square(lambda2) * lambda;
-
-            // exp() overflows to +inf for very cold surfaces / short
-            // wavelengths; the radiance then correctly evaluates to zero.
-            UnpolarizedSpectrum x = ScalarFloat(c2) / (lambda * T);
-            UnpolarizedSpectrum B = ScalarFloat(c1L) / (lambda5 * (dr::exp(x) - 1.f));
-
-            // Density per nanometer rather than per meter
-            B *= 1e-9f;
-
-            return dr::select(active && T > 0.f, B, 0.f);
+            UnpolarizedSpectrum B = planck_radiance(si.wavelengths, T);
+            return dr::select(active, B, 0.f);
         } else {
             DRJIT_MARK_USED(si);
             DRJIT_MARK_USED(active);

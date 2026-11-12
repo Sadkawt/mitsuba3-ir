@@ -21,6 +21,11 @@ python 01_lwir_basic.py cuda_ad_spectral
 | `04_kirchhoff_checks.py` | Rendered vs. analytic radiance for plates, cavities and angular emissivity of a conductor |
 | `05_temperature_texture.py` | Temperature field as a raw float bitmap texture |
 | `06_ecostress.py` | Using measured ECOSTRESS/ASTER reflectance spectra as Lambertian IR materials |
+| `07_atmosphere.py` | Emissive air (`volpath_ir`): attenuation and path radiance versus range, gray or `--hitran` absorption |
+| `08_sky.py` | `thermalsky`: clear-sky radiance versus zenith angle; a polished metal plate mirroring the sky |
+| `09_hitran_transmittance.py` | Line-by-line H₂O/CO₂ transmittance from HITRAN (`hapi`); attenuated sun and air medium |
 
 Requirements: a spectral variant of Mitsuba (`scalar_spectral`, `llvm_ad_spectral`
 or `cuda_ad_spectral`), NumPy; matplotlib is used for the figures when available.
+`09_hitran_transmittance.py` (and `07 --hitran`) need the `hitran-api` package and
+network access to hitran.org on first run (line data are cached in `hitran_db/`).

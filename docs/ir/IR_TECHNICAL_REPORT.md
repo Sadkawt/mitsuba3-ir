@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.2 — Phase 2 (infrared material data, helper library, examples) |
+| **Version** | 0.3 — Phase 3 (emissive atmosphere: media, sky, HITRAN transmittance) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -404,7 +404,13 @@ dielectric BSDF; Phase 2 adds those data sets.
 | `src/python/python/ir/{__init__,radiometry,materials,scene}.py` | `mitsuba.ir` helper package (Section 7.1) | ✅ |
 | `resources/ir_data/ior/*_ir.{eta,k}.spd`, `make_ior_ir.py`, `README_ir.md` | IR optical constants and generator (Section 6) | ✅ |
 | `src/python_tests/test_ir.py` | Tests of the helper package and data | ✅ |
-| `examples/ir/` | Six example scripts and README (Section 7.2) | ✅ |
+| `examples/ir/` | Nine example scripts and README (Section 7.2) | ✅ |
+| `include/mitsuba/render/thermal.h` | Shared Planck function and constants | ✅ |
+| `include/mitsuba/render/medium.h`, `src/render/medium.cpp`, `src/render/python/medium_v.cpp` | `temperature` volume and `is_thermal()` on all media | ✅ |
+| `src/integrators/volpath_ir.cpp` | Volumetric IR path tracer (Section 6.5) | ✅ |
+| `src/emitters/thermalsky.cpp` | Clear-sky thermal emitter (Section 6.6) | ✅ |
+| `src/python/python/ir/atmosphere.py` | Sky emissivity, air media, HITRAN helper (Sections 6.6, 6.7) | ✅ |
+| `src/integrators/tests/test_volpath_ir.py`, `src/emitters/tests/test_thermalsky.py` | Tests | ✅ |
 
 ### 4.2 `thermal` emitter
 
@@ -433,7 +439,7 @@ the mean of a near-isothermal scene upward.
 
 Non-thermal emitters (sun, sky, lamps, `area`, `envmap`, …) are handled
 exactly as in `path`, so mixed scenes work (`test07_thermal_plus_solar_mixed`).
-Participating media are not handled (📝 `volpath_ir`, Phase 3).
+Participating media are not handled (see `volpath_ir`, Section 6.5).
 
 ### 4.4 Interaction with the rest of Mitsuba
 
@@ -496,7 +502,7 @@ Things that silently do **not** work in the IR and are flagged here:
 | `hdrfilm` | Converts to XYZ; zero outside the visible | Use `specfilm` |
 | `blackbody` spectrum plugin | Masks wavelengths outside its `wavelength_min/max` (default 360–830 nm) | Set the range, or use `thermal` |
 | Conductor material presets (`material="Al"`, …) | Data cover 360–830 nm only | IR optical constants (Section 6) |
-| `sunsky`/`envmap` | Visible-light models | IR sun and sky models (📝 Phase 3) |
+| `sunsky`/`envmap` | Visible-light models | `mitsuba.ir.sun` and the `thermalsky` emitter (Sections 6.4, 6.6) |
 
 ---
 
@@ -599,8 +605,95 @@ irradiance by construction; the blackbody deviates from the measured
 extraterrestrial spectrum [26] by up to ≈ 10 % in parts of the SWIR
 (Fraunhofer and molecular bands), which can be corrected by passing a
 measured spectrum as τ(λ)·E. Atmospheric transmission (H₂O, CO₂ bands) is
-essential in the MWIR/SWIR and is the subject of Phase 3; until then the
-helper produces top-of-atmosphere sunlight.
+essential in the MWIR/SWIR; Section 6.7 provides a HITRAN line-by-line
+transmittance for τ(λ). Without it the helper produces top-of-atmosphere
+sunlight.
+
+### 6.5 Emissive participating media (`volpath_ir`)
+
+> **A14 — Media are in local thermodynamic equilibrium and emit
+> σ_a B(λ, T_m).** A medium with a ``temperature`` field radiates
+> isotropically with its absorption coefficient; Kirchhoff's law for volumes.
+
+*Motivation.* This is the standard source term of the radiative transfer
+equation for gases and aerosols at terrestrial temperatures [5 §11, 6 §10];
+it is what makes the atmosphere both attenuate and *add* radiance ("path
+radiance") in the infrared. Mitsuba's ``volpath`` ignores emission; the new
+``volpath_ir`` integrator adds it. The `temperature` is a `Volume`, so
+heterogeneous fields (exhaust plumes from CFD) are supported through the
+`heterogeneous` medium.
+
+**Difference formulation for media.** Along a ray through a medium,
+
+$$
+L = \int_0^d T(s)\,\sigma_a B(T_m)\,ds + \int_0^d T(s)\,\sigma_s L_s\,ds + T(d)\,L(y).
+$$
+
+Because the phase function is normalised, the in-scattered radiance can be
+written as L_s = B(T_m) + ∫ p (L_i − B(T_m)) dω — exactly the surface
+identity (2) with the BSDF replaced by a lossless phase function. The
+absorption and scattering branches of a real collision therefore combine into
+a single rule: **at a real collision add β (B(T_m) − B_prev), multiply β by
+the single-scattering albedo, and set B_prev := B(T_m)**; the pending
+subtraction of B_prev is settled at the first event of every continuation
+(real collision, surface hit, or escape), never at null collisions. The
+estimator is unbiased (Section 8, `test02`–`test08`), has zero variance in an
+isothermal medium (every collision contributes zero; `test03`), and needs
+neither σ_a at collisions nor a separate emission-sampling strategy. With
+spectrally varying extinction, the thermal term uses the real-collision
+weight σ_t / p_real, i.e. volpath's hero-wavelength scattering weight with
+the albedo removed, which keeps the spectral MIS of `volpath` intact.
+
+Media without a temperature are at 0 K (consistent with A6): they attenuate
+and scatter but do not emit. Since the atmosphere always emits in the
+MWIR/LWIR, an air medium must be given its air temperature
+(`mitsuba.ir.air_medium`).
+
+### 6.6 Clear-sky thermal radiance (`thermalsky`)
+
+> **A15 — The clear sky is a plane-parallel isothermal slab at the
+> near-surface air temperature with zenith emissivity ε_z(λ).** Its
+> downwelling radiance is L(θ, λ) = ε(θ, λ) B(λ, T_air) with
+> ε(θ) = 1 − (1 − ε_z)^{sec θ}, i.e. optical depth τ_z sec θ; below the
+> horizon the emitter returns B(T_air).
+
+*Motivation.* The sec θ air-mass scaling is the plane-parallel
+approximation that underlies both the measured angular distribution of
+clear-sky longwave radiance (Unsworth & Monteith 1975 [33]: radiance rises
+towards the horizon and approaches blackbody emission at the air
+temperature) and operational models [11 §1, 12]. Using the screen-level air
+temperature as the slab temperature slightly overestimates the window
+radiance for the upper atmosphere, which is colder; this is partly absorbed
+into the empirical ε_z. For the zenith emissivity, `mitsuba.ir.sky_emissivity_idso`
+implements Idso's (1981) [32] clear-sky formulas (full spectrum, 8–14 µm,
+10.5–12.5 µm) in terms of air temperature and vapour pressure (Magnus
+formula, WMO No. 8). Typical result: T_air = 293 K, RH 60 % → ε_z(8–14 µm)
+= 0.40, apparent zenith temperature 245 K, horizon 293 K
+(`examples/ir/08_sky.py`). A spectral ε_z(λ) table (e.g. 1 − τ from a
+MODTRAN run) can be supplied instead of the band constant; clouds and
+aerosol are not modelled.
+
+### 6.7 Molecular transmittance from HITRAN
+
+> **A16 — Line-by-line molecular absorption (H₂O, CO₂, …) from HITRAN,
+> without continuum or aerosols.** `mitsuba.ir.hitran_absorption` computes
+> σ_a(λ) of humid air with the HITRAN Application Programming Interface
+> [51] (Voigt profiles, ±25 cm⁻¹ line wings, TIPS partition sums), for use
+> as the extinction of an `air_medium` and as the transmittance of the
+> `sun`.
+
+*Motivation.* HITRAN [35] is the reference spectroscopic database; `hapi`
+is its official line-by-line tool and reproduces the band structure that
+dominates MWIR/LWIR transmission (CO₂ at 4.3 µm: τ(1 km) = 0.04; 3.5–4.1 µm:
+0.998; H₂O lines in the LWIR: 0.85 band-averaged over 1 km at RH 50 %).
+**Limitation stated to the user:** the water-vapour *continuum* (MT_CKD,
+Mlawer et al. 2012 [52]) is not part of HITRAN line lists and is the
+dominant absorber in the 8–13 µm window at high humidity; aerosol
+extinction is absent too. Window transmittances are therefore upper
+bounds (0.97 over 1 km at 10–12 µm here, where MODTRAN mid-latitude summer
+gives ≈ 0.8). For radiometric accuracy at long ranges a MODTRAN-type
+transmittance table should be passed to `air_medium`/`sun`; the plumbing is
+identical.
 
 ---
 
@@ -620,6 +713,8 @@ helper produces top-of-atmosphere sunlight.
 | `conductor_ir`, `opaque_ir`, `window_ior`, `load_ior`, `IR_MATERIALS` | Material builders and data access (Section 6) |
 | `drude_lorentz_nk`, `normal_emissivity`, `hemispherical_emissivity`, `fresnel_conductor` | Analytic material physics |
 | `load_ecostress`, `diffuse_from_emissivity`, `diffuse_from_reflectance` | Spectral-library workflow (Section 6.3) |
+| `sky_emissivity_idso`, `vapour_pressure`, `thermalsky` | Clear-sky emissivity and `thermalsky` emitter dictionaries (Section 6.6) |
+| `air_medium`, `medium_box`, `hitran_absorption`, `transmittance`, `atmosphere.band_average` | Emissive air media and HITRAN line-by-line absorption (Sections 6.5, 6.7) |
 | `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
 
 ### 7.2 Examples (`examples/ir/`)
@@ -632,6 +727,9 @@ helper produces top-of-atmosphere sunlight.
 | `04_kirchhoff_checks.py` | Rendered vs. analytic radiance | All cases within 2.6·10⁻⁴ (Section 8) |
 | `05_temperature_texture.py` | Temperature field as a raw float bitmap | Hot spot 340 K with ε = 0.9 under a 260 K sky: rendered 334.5 K vs. expected 334.0 K |
 | `06_ecostress.py` | Measured reflectance spectra as Lambertian IR materials | Rendered radiance equals ε_band·B to 0.07 % |
+| `07_atmosphere.py` | `volpath_ir` with an emissive air layer of 10 m–10 km in front of a 350 K plate (gray or `--hitran` absorption) | Matches τ L_up + (1−τ) B_air (hemispherical slab term for L_down) to < 0.3 % at short range, ≤ 2 % at 10 km (Monte Carlo noise, 1024 spp) |
+| `08_sky.py` | `thermalsky` angular radiance; polished Al plate mirroring the sky | Sky 245 K (zenith) → 293 K (horizon); 300 K Al plate reads 245–293 K depending on tilt |
+| `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km in MWIR/LWIR; attenuated sun and air medium | CO₂ band opaque, 3.5–4.1 µm clear |
 
 ---
 
@@ -667,6 +765,21 @@ Phase 2 adds `src/python_tests/test_ir.py` (13 tests on all spectral variants):
 | `test08` | Sun on a diffuse plate gives ρE/π with the physically scaled spectrum | — |
 | `test09` | ECOSTRESS parser (units, ordering) and material construction | [9] |
 
+Phase 3 adds `src/integrators/tests/test_volpath_ir.py` (9 tests) and
+`src/emitters/tests/test_thermalsky.py` (5 tests), all spectral variants:
+
+| Test | Configuration | Reference | Tolerance |
+|---|---|---|---|
+| `volpath_ir/test02` | Cold absorbing slab (σ = 0.7 m⁻¹, 1 m, 280 K) before a 320 K blackbody plate; spectral and gray extinction | τ B(T₁) + (1−τ) B(T_m) | 1.5 % |
+| `volpath_ir/test03` | Isothermal slab + blackbody plate | B(T), zero variance | 0.2 % |
+| `volpath_ir/test03b` | Isothermal slab + plate of albedo 0.3 under a black sky | τ L_up + (1−τ) B | 1.5 % |
+| `volpath_ir/test04` | Hot absorbing slab, no background | (1−τ) B(T_m) | 1.5 % |
+| `volpath_ir/test05` | Purely scattering slab at 350 K | 0 (no absorption → no emission) | 2 % of B |
+| `volpath_ir/test06` | Camera inside a diffuse isothermal cavity filled with a scattering/absorbing medium | B(T) | 2 % |
+| `volpath_ir/test07` | No media: plate in cavity | same as `path_ir` | 1.5 % |
+| `volpath_ir/test08` | Wavelength-dependent σ_a (irregular spectrum) | ∫ e^{−σ(λ)d} B dλ | 2 % |
+| `thermalsky/test01–05` | Zenith/horizon/below-horizon values, isotropic model, `up` vector, spectral ε_z, sampling consistency, conductor plate reflecting the zenith (F(0) ε_z B) | closed forms | ≤ 0.3 % |
+
 **Convergence study** (isothermal cavity, L/B, 4 seeds): diffuse wall is
 exactly 1.0000 at any sample count (zero variance, as derived in Section
 3.2); rough Al (α = 0.3): 0.998 ± 0.011 at 256 spp, 1.003 ± 0.001 at 4096,
@@ -700,14 +813,12 @@ given a correspondingly large `sampling_weight`; see Section 4.4.
 |---|---|---|
 | 1 | Thermal emission of surfaces, Kirchhoff coupling, `path_ir`, validation | ✅ |
 | 2 | IR material data (Section 6), `mitsuba.ir` helpers, examples | ✅ |
-| 3 | Atmosphere: emissive/absorbing media (`volpath_ir`) [36], sun as 5772 K source with ASTM G173 spectrum [26], clear-sky LWIR model [32, 33]; user-supplied transmittance spectra (e.g. from MODTRAN/HITRAN [34, 35]) | 📝 |
+| 3 | Emissive media (`volpath_ir`, medium `temperature`), `thermalsky`, Idso clear-sky emissivity, HITRAN transmittance | ✅ |
 | 4 | Sensor model: detector response curves [40], apparent-temperature output, NETD noise model | 📝 |
 | 5 | Polarized thermal emission; multiple-scattering microfacet BSDFs [22]; differentiable temperature | 📝 |
 
 Known limitations of the present state:
 
-* No participating media (atmosphere, exhaust plumes) — `path_ir` ignores
-  media like `path` does.
 * Emissivity of rough surfaces follows the single-scattering microfacet
   models (A5).
 * Uniform emitter selection for next-event estimation (Section 4.4).
@@ -715,7 +826,8 @@ Known limitations of the present state:
   soils and fabrics must come from spectral libraries (Section 6.3) or user
   measurements. Only hemispherical (Lambertian) use of library data is
   supported; measured BRDFs are not.
-* `sun` has no atmosphere; `sky_blackbody` is isotropic (Phase 3).
+* Atmosphere: no water-vapour continuum, no aerosols, no clouds (A15, A16);
+  the sky is an isothermal slab at the screen-level air temperature.
 * Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
 
 ---
@@ -822,12 +934,21 @@ Known limitations of the present state:
 
 [50] H. H. Li, "Refractive index of alkaline earth halides and its wavelength and temperature derivatives," *Journal of Physical and Chemical Reference Data* 9(1), 161–289, 1980.
 
+[51] R. V. Kochanov, I. E. Gordon, L. S. Rothman, P. Wcisło, C. Hill, J. S. Wilzewski, "HITRAN Application Programming Interface (HAPI): A comprehensive approach to working with spectroscopic data," *Journal of Quantitative Spectroscopy and Radiative Transfer* 177, 15–30, 2016.
+
+[52] E. J. Mlawer, V. H. Payne, J.-L. Moncet, J. S. Delamere, M. J. Alvarado, D. C. Tobin, "Development and recent evaluation of the MT_CKD model of continuum absorption," *Philosophical Transactions of the Royal Society A* 370, 2520–2556, 2012.
+
+[53] J. L. Monteith, M. H. Unsworth, *Principles of Environmental Physics*, 4th ed., Academic Press, 2013 (ch. 5, long-wave radiation of clear skies).
+
+[54] World Meteorological Organization, *Guide to Meteorological Instruments and Methods of Observation*, WMO-No. 8, 2008 (Magnus-type saturation vapour pressure formula).
+
 ---
 
 ## Appendix A — Changelog
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-12 | 0.3 | Phase 3: medium `temperature`, `volpath_ir` (difference formulation for emissive media), `thermalsky` emitter, `mitsuba.ir.atmosphere` (Idso emissivity, air media, HITRAN line-by-line via hapi), 14 new tests, examples 07–09, assumptions A14–A16, references [51]–[54]. |
 | 2026-11-12 | 0.2 | Phase 2: `*_ir` optical constants (22 presets, Lorentz–Drude metals verified to 1.3·10⁻⁴ against [43]; dielectrics/water from [43]), `mitsuba.ir` package (radiometry, materials, scene helpers), 13 new tests, `examples/ir/` (6 scripts), assumptions A9–A13, convergence study. |
 | 2026-11-12 | 0.1 | Phase 1: `EmitterFlags::Thermal`, `Integrator::thermal_aware()`, `thermal` emitter, `path_ir` integrator, scene-level compatibility warning, unit and validation tests, this report. |
 
