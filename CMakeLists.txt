@@ -612,6 +612,21 @@ if (MSVC AND MI_ENABLE_PYTHON)
     "${MI_BINARY_DIR}/python/mitsuba/data/ior"
   )
 endif()
+# Infrared optical constants (*_ir presets, see docs/ir/IR_TECHNICAL_REPORT.md)
+add_custom_command(
+  TARGET copy-resources POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/ir_data/ior"
+  "${MI_BINARY_DIR}/data/ior"
+)
+if (MSVC AND MI_ENABLE_PYTHON)
+  add_custom_command(
+    TARGET copy-resources POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/ir_data/ior"
+    "${MI_BINARY_DIR}/python/mitsuba/data/ior"
+  )
+endif()
 install(
   DIRECTORY ${MI_BINARY_DIR}/data/ior
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}

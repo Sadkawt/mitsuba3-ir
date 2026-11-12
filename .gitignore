@@ -35,3 +35,6 @@ __pycache__
 /docs/src/quickstart
 /docs/src/generated
 /docs/resources
+examples/ir/output/
+build/
+.venv-build/

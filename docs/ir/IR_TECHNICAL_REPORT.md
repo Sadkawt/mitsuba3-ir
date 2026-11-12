@@ -1,0 +1,844 @@
+# Physically Based Infrared Rendering in Mitsuba 3 — Technical Report
+
+| | |
+|---|---|
+| **Version** | 0.2 — Phase 2 (infrared material data, helper library, examples) |
+| **Date** | 2026-11-12 |
+| **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
+| **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
+| **Status legend** | ✅ implemented and tested · 🔧 implemented, validation pending · 📝 planned |
+
+This document is the living specification of the infrared (IR) extension of
+Mitsuba 3. It records *what* was added, *why* each modelling choice was made,
+and *which assumptions* it rests on. Every assumption is numbered (**A1**,
+**A2**, …), stated explicitly, motivated, and referenced. The document is
+updated with every change to the code; the changelog is in Appendix A.
+
+---
+
+## Contents
+
+1. [Scope and goals](#1-scope-and-goals)
+2. [Radiometric framework](#2-radiometric-framework)
+3. [Surface emission model](#3-surface-emission-model)
+4. [Implementation reference](#4-implementation-reference)
+5. [Spectral sampling, bands and films](#5-spectral-sampling-bands-and-films)
+6. [Infrared material data](#6-infrared-material-data)
+7. [Helper library and examples](#7-helper-library-and-examples)
+8. [Validation](#8-validation)
+9. [Limitations and roadmap](#9-limitations-and-roadmap)
+10. [References](#10-references)
+- [Appendix A — Changelog](#appendix-a--changelog)
+- [Appendix B — Build notes](#appendix-b--build-notes)
+
+---
+
+## 1. Scope and goals
+
+### 1.1 Goal
+
+Extend Mitsuba 3 [15, 16] so that it produces *radiometrically meaningful*
+images in the three infrared bands used by electro-optical imaging systems:
+short-wave (SWIR), mid-wave (MWIR) and long-wave (LWIR) infrared. "Physically
+accurate" is understood in the sense of the rendering community: the renderer
+solves the (spectral) radiative transfer equation without further
+approximation than Monte Carlo noise, given a scene description whose
+materials, temperatures and sources are physically specified. The accuracy
+of a rendered image is then bounded by the accuracy of the inputs (surface
+temperatures, spectral optical constants, atmosphere), and the extension
+therefore also provides physically grounded *defaults* and *data* for these
+inputs.
+
+### 1.2 Spectral bands
+
+ISO 20473 [14] divides the infrared into near (0.78–3 µm), mid (3–50 µm) and
+far (50–1000 µm) infrared. Imaging-system engineering uses a finer split,
+dictated by the atmospheric transmission windows and by detector technology
+[11 §1.2, 12 ch. 4, 13, 40]:
+
+| Band | Range used here | Typical detector | Dominant signal at ~300 K scene |
+|---|---|---|---|
+| SWIR | 0.9–2.5 µm (0.9–1.7 µm for InGaAs) | InGaAs, HgCdTe | Reflected sunlight/sky; emission negligible |
+| MWIR | 3–5 µm | InSb, HgCdTe, T2SL | Mixed: thermal emission *and* reflected sunlight |
+| LWIR | 8–14 µm (7.5–14 µm microbolometer) | HgCdTe, microbolometer | Thermal emission; reflected sunlight negligible |
+
+Everything in this extension is wavelength-generic; the bands only enter
+through the sensor response functions (Section 5).
+
+### 1.3 Why visible-light rendering is not enough
+
+Table 1 quantifies the two terms of the radiance leaving a surface at 300 K
+with hemispherical reflectance ρ = 0.5 under direct sunlight: the thermal
+emission B(λ, 300 K) (per Planck, Section 2.2) and the reflected solar
+radiance ρ E_sun(λ)/π, with E_sun the top-of-atmosphere solar spectral
+irradiance modelled as a 5772 K blackbody [27] seen under the solid angle
+of the solar disc ((R_sun/1 AU)² = 2.163·10⁻⁵). The atmosphere would reduce
+E_sun further (Section 9); the numbers are therefore an *upper bound* on the
+reflected term.
+
+**Table 1 — Thermal emission vs. reflected sunlight (W m⁻² sr⁻¹ nm⁻¹).**
+
+| λ (µm) | B(300 K) | B(320 K) | B(600 K) | E_sun,TOA (W m⁻² nm⁻¹) | ρE/π (ρ=0.5) | emission / reflection |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.9 | 1.5·10⁻¹⁸ | 4.1·10⁻¹⁷ | 5.4·10⁻⁷ | 0.92 | 0.15 | 1·10⁻¹⁷ |
+| 1.5 | 2.0·10⁻¹⁰ | 1.5·10⁻⁹ | 1.8·10⁻³ | 0.25 | 4.0·10⁻² | 5·10⁻⁹ |
+| 2.2 | 7.9·10⁻⁷ | 3.1·10⁻⁶ | 4.3·10⁻² | 7.5·10⁻² | 1.2·10⁻² | 7·10⁻⁵ |
+| 3.0 | 5.6·10⁻⁵ | 1.5·10⁻⁴ | 0.17 | 2.6·10⁻² | 4.1·10⁻³ | 1.4·10⁻² |
+| 4.0 | 7.2·10⁻⁴ | 1.5·10⁻³ | 0.29 | 9.1·10⁻³ | 1.5·10⁻³ | 0.50 |
+| 5.0 | 2.6·10⁻³ | 4.7·10⁻³ | 0.32 | 4.0·10⁻³ | 6.4·10⁻⁴ | 4.1 |
+| 8.0 | 9.1·10⁻³ | 1.3·10⁻² | 0.19 | 6.8·10⁻⁴ | 1.1·10⁻⁴ | 84 |
+| 10.0 | 9.9·10⁻³ | 1.3·10⁻² | 0.12 | 2.9·10⁻⁴ | 4.6·10⁻⁵ | 218 |
+| 12.0 | 9.0·10⁻³ | 1.2·10⁻² | 7.5·10⁻² | 1.4·10⁻⁴ | 2.2·10⁻⁵ | 400 |
+| 14.0 | 7.4·10⁻³ | 9.3·10⁻³ | 4.9·10⁻² | 7.7·10⁻⁵ | 1.2·10⁻⁵ | 606 |
+
+Consequences that drive the design:
+
+1. **Every surface is a light source in the MWIR and LWIR.** A renderer that
+   treats emission as a property of a few "light" objects cannot represent
+   this; emission must be a property of *all* geometry (Section 3).
+2. **Emission and reflection are coupled.** By Kirchhoff's law the emissivity
+   is one minus the reflectance (Section 3.1). A material described by a
+   BSDF therefore already determines its emissivity; specifying it
+   separately would double-count or violate energy conservation. This
+   motivates deriving emissivity from the BSDF rather than from a parameter.
+3. **The MWIR is genuinely mixed** (ratio ≈ 0.5 at 4 µm): both terms must be
+   simulated together, which rules out "thermal-only" shortcuts.
+4. **Small temperature contrasts matter.** In the LWIR, dB/dT at 300 K is
+   1.6 % per kelvin (4.0 % per kelvin in the MWIR); a camera with a noise
+   equivalent temperature difference of 50 mK resolves ≈ 0.1 % radiance
+   contrasts. Monte Carlo noise must be well below that, which motivates a
+   low-variance estimator for emission (Section 3.2).
+5. **Visible-light material data do not extrapolate.** The optical
+   constants shipped with Mitsuba (`resources/data/ior`) cover 360–830 nm;
+   spectral upsampling from RGB (`srgb` textures) is defined only on that
+   range. IR renderings need IR optical constants and emissivity spectra
+   (Section 6).
+
+---
+
+## 2. Radiometric framework
+
+### 2.1 Units
+
+> **A1 — Units.** Scene geometry is in metres, wavelengths in nanometres,
+> temperatures in kelvin, spectral radiance in W m⁻² sr⁻¹ nm⁻¹.
+
+*Motivation.* Mitsuba is unit-agnostic except where Planck's law introduces
+absolute units (its `blackbody` plugin already uses W m⁻² sr⁻¹ nm⁻¹ and
+nanometre wavelengths). Keeping nanometres (LWIR: 8 000–14 000 nm) keeps
+every existing spectrum plugin, file format (`.spd`) and the spectral film
+usable without change. The scene must be modelled in metres because the
+emitted radiance is independent of scale only if geometry and radiometry
+use the same length unit.
+
+### 2.2 Planck's law
+
+The spectral radiance of a blackbody at temperature T is [1]
+
+$$
+B_\lambda(\lambda, T) = \frac{2hc^2}{\lambda^5}\,
+\frac{1}{\exp\!\left(\dfrac{hc}{\lambda k_B T}\right) - 1}
+\quad [\mathrm{W\,m^{-2}\,sr^{-1}\,m^{-1}}],
+$$
+
+multiplied by 10⁻⁹ to obtain a density per nanometre. The implementation
+(`src/emitters/thermal.cpp`) uses the exact SI 2019 values [20]
+h = 6.626 070 15·10⁻³⁴ J s, c = 299 792 458 m s⁻¹, k_B = 1.380 649·10⁻²³ J K⁻¹,
+giving c₁L = 2hc² = 1.191 042 972·10⁻¹⁶ W m² sr⁻¹ and
+c₂ = hc/k_B = 1.438 776 877·10⁻² m K. (Mitsuba's `blackbody` spectrum plugin
+uses CODATA 2014 values; the relative difference is < 3·10⁻⁶ and is checked
+by `test05_matches_blackbody_spectrum`.)
+
+Band-integrated blackbody radiance at 300 K (numerical integration, used as
+test references):
+
+| Band | ∫B dλ (W m⁻² sr⁻¹) | Fraction of σT⁴/π |
+|---|---:|---:|
+| SWIR 0.9–1.7 µm | 3.2·10⁻⁷ | ≈ 0 |
+| SWIR 0.9–2.5 µm | 8.7·10⁻⁴ | ≈ 0 |
+| MWIR 3–5 µm | 1.866 | 1.28 % |
+| LWIR 8–14 µm | 54.93 | 37.6 % |
+| LWIR 7.5–13.5 µm | 55.49 | 38.0 % |
+
+Numerical note: the implementation evaluates Planck's law in single
+precision. For λ ≥ 900 nm and T ≥ 100 K all intermediate quantities
+(λ⁵ ≥ 6·10⁻³², exp(c₂/λT)) stay inside the normal range of `float`; for
+colder/shorter combinations `exp` overflows to +∞ and the radiance correctly
+evaluates to 0.
+
+### 2.3 Band radiance and sensor response
+
+A detector with spectral response R(λ) (dimensionless, 0–1) integrates
+
+$$
+L_{\mathrm{band}} = \int L_\lambda(\lambda)\, R(\lambda)\, d\lambda
+\quad [\mathrm{W\,m^{-2}\,sr^{-1}}].
+$$
+
+Mitsuba's `specfilm` computes exactly this quantity per channel: wavelengths
+are importance-sampled proportionally to the sum of all channel responses,
+and each sample's contribution is weighted by R_j(λ)/p(λ) (Section 5). With
+R ≡ 1 on a band the output is the band radiance; with the detector's actual
+R it is the in-band radiance "seen" by the detector. Conversion to apparent
+(brightness) temperature — inverting the band-integrated Planck function —
+is a post-process (📝 Phase 4).
+
+---
+
+## 3. Surface emission model
+
+### 3.1 Kirchhoff's law
+
+For a surface element in local thermodynamic equilibrium (LTE) at
+temperature T, the directional spectral emissivity equals the directional
+spectral absorptivity [2, 3, 5 §3, 6 §3]. For an *opaque* surface,
+absorptivity is one minus the directional-hemispherical reflectance ρ_dh,
+which is the integral of the BRDF f over the hemisphere [4]:
+
+$$
+\varepsilon(\lambda, \omega_o) = 1 - \rho_{dh}(\lambda, \omega_o)
+= 1 - \int_{H^2} f(\lambda, \omega_i, \omega_o)\, |\cos\theta_i|\, d\omega_i .
+\tag{1}
+$$
+
+For a non-opaque interface the integral runs over the full sphere and
+includes the transmission lobe; a lossless dielectric interface
+(R + T = 1) then has zero emissivity, which is correct: the emission of a
+window comes from absorption in its *volume*, not from the interface.
+
+> **A2 — Local thermodynamic equilibrium.** Every surface radiates in LTE
+> at a well-defined local temperature T(x), and Kirchhoff's law in its
+> directional-spectral form (1) holds.
+
+*Motivation.* LTE holds for condensed matter at terrestrial temperatures
+and for the time scales of imaging; it is the standard assumption of
+thermal-infrared remote sensing and signature modelling [5, 6, 8, 11, 24].
+Violations (luminescence, non-equilibrium plasmas, lasers) are out of scope.
+
+> **A3 — Emissivity from the BSDF.** The emissivity is *not* an independent
+> material parameter. It is defined by equation (1) from the BSDF attached
+> to the shape, so that a single material description is valid from the
+> SWIR (reflective) to the LWIR (emissive).
+
+*Motivation.* (i) Energy conservation: ε + ρ_dh = 1 is enforced by
+construction; an independent emissivity could not be guaranteed consistent
+with the BSDF. (ii) Directional behaviour: a smooth conductor has
+ε(θ) = 1 − F(θ), and a rough surface has the angular emissivity implied by
+its microfacet distribution [8, 21]; these fall out of (1) automatically.
+(iii) It matches how measured data is used in practice: hemispherical
+reflectance spectra of the ASTER/ECOSTRESS libraries [9, 10] are converted
+to emissivity through ε = 1 − ρ under a Lambertian assumption — in our
+framework one simply sets a `diffuse` reflectance of 1 − ε(λ) (Section 3.4).
+
+> **A4 — Unpolarized transport.** Thermal emission and reflection are
+> simulated without polarization state (non-polarized variants).
+
+*Motivation.* Thermal emission is unpolarized at normal incidence and only
+partially polarized at grazing angles (the s and p Fresnel reflectances
+differ); this affects radiance only for polarization-sensitive sensors.
+Mitsuba's polarized variants could be enabled later; the formulation of
+Section 3.2 extends to Mueller-matrix transport unchanged because it only
+uses BSDF evaluation and sampling. 📝 Phase 5.
+
+> **A5 — BSDF energy loss is interpreted as absorption.** For BSDFs whose
+> hemispherical albedo is less than the physical one because of modelling
+> approximations (single-scattering microfacet models lose energy at high
+> roughness [21, 22]), the missing energy is treated as absorbed and hence
+> contributes to emission.
+
+*Motivation.* This is the only choice consistent with (1) and keeps the
+renderer energy-conserving. The error is the same one that already affects
+visible renderings with these BSDFs; multiple-scattering microfacet models
+[22] remove it. The effect is quantified in Section 6 (planned).
+
+### 3.2 The difference formulation
+
+Inserting (1) into the rendering equation [19] for the outgoing radiance of
+a thermal surface,
+
+$$
+L_o(\omega_o) = \varepsilon(\omega_o)\, B(T) + \int f(\omega_i,\omega_o)\,
+L_i(\omega_i)\, |\cos\theta_i|\, d\omega_i
+= B(T) + \int f(\omega_i,\omega_o)\, \big(L_i(\omega_i) - B(T)\big)\,
+|\cos\theta_i|\, d\omega_i .
+\tag{2}
+$$
+
+Equation (2) is exact and requires *no* evaluation of the emissivity or of
+the BSDF's albedo. It is the surface analogue of the *net-exchange*
+formulation of Monte Carlo radiative heat transfer [7, 41], where the
+transported quantity is the difference between two blackbody radiances.
+
+**Path-space estimator.** Let a path have vertices x₀ (camera), x₁, x₂, …,
+with BSDF sampling weights w_k = f cos θ / p at each scattering vertex and
+throughput β_k = ∏_{j<k} w_j. Expanding (2) recursively:
+
+$$
+L(x_0 \leftarrow x_1) = B_1 + w_1\,(B_2 - B_1) + w_1 w_2\,(B_3 - B_2) + \dots
+= \sum_{k \ge 1} \beta_k\,\big(B_k - B_{k-1}\big), \qquad B_0 := 0,
+\tag{3}
+$$
+
+where B_k is the blackbody radiance of vertex k, zero for a non-thermal
+surface, and where a ray that escapes the scene (or hits a non-thermal
+emitter with radiance L_e) contributes β_k (L_e − B_{k−1}). In words: **add
+the full blackbody radiance B_k at every thermal vertex, and subtract
+B_{k−1} (the previous vertex's blackbody radiance) once for every
+continuation ray.** The subtraction is what turns B_k into ε_k B_k in
+expectation: E[w_k] = ρ_dh, so E[B_k − w_k B_k] = (1 − ρ_dh) B_k = ε_k B_k.
+
+**Properties.**
+
+* *Unbiased for any BSDF,* as long as the BSDF sampling routine is unbiased
+  for its albedo (E[w] = ρ_dh), which is a weaker requirement than being
+  able to evaluate ρ_dh.
+* *Zero variance in the important special cases.* If w_k equals the albedo
+  deterministically — diffuse (w = ρ), smooth conductor (w = F(θ)), smooth
+  dielectric (w = 1) — the emission estimate B_k (1 − w_k) is exact per
+  sample. In particular, an isothermal enclosure of such materials renders
+  with zero variance (`test02_isothermal_enclosure_specular`), and a diffuse
+  plate against a cold background renders (1 − ρ)B exactly
+  (`test01_diffuse_plate_cold_background`).
+* *Variance scales with temperature differences,* not with absolute
+  radiance: in a scene where all temperatures lie within ±10 K of 300 K the
+  terms B_k − B_{k−1} are at most ±16 % of B in the LWIR, whereas an estimator
+  that samples ε_k B_k directly has variance proportional to B². This is
+  why the formulation was chosen over the obvious alternative of adding an
+  `albedo()` method to every BSDF and multiplying B by a stochastic
+  estimate of 1 − albedo.
+* *Graceful truncation.* When the path is cut by `max_depth` after vertex k,
+  the missing term is β_{k+1}(L(x_{k+1}) − B_k), i.e. the error is
+  proportional to how much the unseen radiance differs from B_k. In a
+  near-isothermal environment this is nearly zero, whereas the standard
+  formulation drops β_{k+1} L(x_{k+1}) entirely. Operationally, the
+  subtraction of B_k is *not* performed when no continuation ray is traced.
+* *Russian roulette* is unbiased unchanged: the continuation (including its
+  −B_k term) is either dropped or reweighted by 1/p_rr as a whole.
+
+**Multiple importance sampling.** The term B_k at a thermal vertex reached
+by BSDF sampling is an emitter contribution and is MIS-weighted against
+next-event estimation exactly as in Mitsuba's `path` integrator [18];
+next-event estimation of a thermal emitter returns B(T) at the sampled
+point. The subtracted term −B_{k−1} is *not* an emitter contribution: it is
+part of the integrand of the continuation and is therefore always applied
+with the plain BSDF sampling weight and no MIS weight.
+
+**Null surfaces.** Shapes with a `null` BSDF are not path vertices. The
+subtraction belongs to the first surface encountered by the continuation
+ray — null or not — or to the ray escaping; it is applied exactly once per
+scattering event (tracked by a `diff_pending` flag).
+
+> **A6 — Surfaces without a thermal emitter are at 0 K.** They reflect and
+> transmit but do not emit.
+
+*Motivation.* This coincides with Mitsuba's existing semantics (an
+un-tagged surface emits nothing), keeps visible-light scenes unchanged, and
+makes the user's intent explicit: an IR scene must assign a temperature to
+every surface, for which a Python helper will be provided (Section 6).
+The alternative — treating un-tagged surfaces as being at the temperature
+of the previous vertex — would silently invent emission.
+
+> **A7 — Thermal emitters report blackbody radiance.** The `thermal`
+> emitter's `eval()` returns B(λ, T(x)); the emissivity is applied by
+> thermal-aware integrators through (3).
+
+*Motivation.* This keeps the emitter plugin free of integrator logic and
+makes next-event estimation trivially correct. The cost is that integrators
+that are not thermal-aware (`path`, `volpath`, `direct`, …) render thermal
+surfaces as blackbodies; the `Scene` constructor therefore logs a warning
+whenever thermal emitters are used with such an integrator
+(`Integrator::thermal_aware()`), and `test01` documents the behaviour.
+
+### 3.3 Temperature fields
+
+The surface temperature is a texture (`temperature` parameter, kelvin), so
+it can be constant, painted (bitmap), procedural, or a mesh attribute
+(`mesh_attribute` texture) produced by an external thermal solver — the
+standard coupling used by signature-prediction tools [25, 42]. Textures are
+evaluated with `eval_1()`, i.e. as a scalar field independent of
+wavelength.
+
+`twosided` defaults to **true** for thermal emitters (unlike `area`):
+physically both faces of a thin surface at temperature T radiate, and for
+closed meshes the inside is never seen, so the default is safe and avoids
+black back-faces when a camera is placed inside a cavity.
+
+### 3.4 Using measured emissivity spectra
+
+Spectral libraries [9, 10] publish directional-hemispherical reflectance
+ρ(λ) (ECOSTRESS) or emissivity ε(λ) = 1 − ρ(λ) measured with an integrating
+sphere, i.e. under the assumption that the surface is Lambertian or that
+only the hemispherical quantity is needed [8]. In this framework such data
+is used by attaching
+
+```python
+'bsdf': {'type': 'diffuse', 'reflectance': {'type': 'irregular',
+          'wavelengths': lam_nm, 'values': 1 - eps}},
+'emitter': {'type': 'thermal', 'temperature': T}
+```
+
+The emissivity then follows exactly: ε(λ) = 1 − (1 − ε(λ)). A loader for
+the ECOSTRESS ASCII format is planned (Section 6). For surfaces that are
+not Lambertian in the IR (metals, glass, water, smooth paints), the correct
+approach is to use the IR optical constants with a (rough) conductor or
+dielectric BSDF; Phase 2 adds those data sets.
+
+---
+
+## 4. Implementation reference
+
+### 4.1 Files
+
+| File | Change | Status |
+|---|---|---|
+| `include/mitsuba/render/emitter.h` | New flag `EmitterFlags::Thermal = 0x100` | ✅ |
+| `include/mitsuba/render/integrator.h` | New virtual `Integrator::thermal_aware()` (default `false`) | ✅ |
+| `src/render/scene.cpp` | Warning when thermal emitters meet a non-thermal-aware integrator | ✅ |
+| `src/render/python/emitter.cpp` | Python binding of `EmitterFlags.Thermal` | ✅ |
+| `src/emitters/thermal.cpp` | New `thermal` emitter plugin | ✅ |
+| `src/integrators/path_ir.cpp` | New `path_ir` integrator (difference formulation) | ✅ |
+| `src/emitters/CMakeLists.txt`, `src/integrators/CMakeLists.txt` | Plugin registration | ✅ |
+| `src/emitters/tests/test_thermal.py` | Unit tests of the emitter | ✅ |
+| `src/integrators/tests/test_path_ir.py` | Analytic validation of the integrator | ✅ |
+| `docs/ir/IR_TECHNICAL_REPORT.md` | This document | ✅ |
+| `src/python/python/ir/{__init__,radiometry,materials,scene}.py` | `mitsuba.ir` helper package (Section 7.1) | ✅ |
+| `resources/ir_data/ior/*_ir.{eta,k}.spd`, `make_ior_ir.py`, `README_ir.md` | IR optical constants and generator (Section 6) | ✅ |
+| `src/python_tests/test_ir.py` | Tests of the helper package and data | ✅ |
+| `examples/ir/` | Six example scripts and README (Section 7.2) | ✅ |
+
+### 4.2 `thermal` emitter
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `temperature` | float or texture | 300 | Surface temperature [K]; spatially varying through any texture |
+| `twosided` | bool | true | Emit from both faces |
+| `wavelength_min`, `wavelength_max` | float | 360, 14000 | Range for *emitter-side* wavelength sampling (only used by light tracing, e.g. `ptracer`); camera-based integrators sample wavelengths from the film's response functions |
+| `sampling_weight` | float | 1 | Inherited: relative probability of next-event estimation picking this emitter |
+
+Requires a spectral variant. `eval`, `sample_direction`, `eval_direction`
+return B(λ, T(x)) (W m⁻² sr⁻¹ nm⁻¹); `sample_ray` and `sample_wavelengths`
+sample uniformly in the wavelength range (the Planck spectrum of a textured
+temperature field has no cheap inverse CDF; uniform sampling is unbiased
+and the range is explicit).
+
+### 4.3 `path_ir` integrator
+
+Parameters are those of `path` (`max_depth`, `rr_depth`, `clamp_direct`,
+`clamp_indirect`). The loop state of the path tracer is extended by
+`B_prev` (the blackbody radiance of the last scattering vertex, per
+wavelength) and `diff_pending` (whether its subtraction is still owed by
+the current continuation ray). Clamping applies only to emitted (positive)
+contributions, never to the difference terms, so that clamping cannot bias
+the mean of a near-isothermal scene upward.
+
+Non-thermal emitters (sun, sky, lamps, `area`, `envmap`, …) are handled
+exactly as in `path`, so mixed scenes work (`test07_thermal_plus_solar_mixed`).
+Participating media are not handled (📝 `volpath_ir`, Phase 3).
+
+### 4.4 Interaction with the rest of Mitsuba
+
+* **Next-event estimation** uses `Scene::sample_emitter_direction`, which
+  picks an emitter proportionally to `sampling_weight` (uniform by
+  default). In an LWIR scene *every* shape is an emitter, so a small hot
+  object or the sun should be given a larger `sampling_weight`; an
+  automatic power-based weighting is a candidate improvement (📝).
+* **Differentiable rendering**: the integrator keeps the detached-sampling
+  logic of `path`; the temperature texture is exposed as a
+  non-differentiable parameter for now (📝 differentiable temperature for
+  inverse thermography).
+* **Hidden emitters / visibility** are honoured unchanged: a thermal emitter
+  hidden from a ray class has B = 0 for that class.
+
+---
+
+## 5. Spectral sampling, bands and films
+
+Mitsuba's spectral variants trace *four* wavelengths per path (hero
+wavelength sampling [17]). The wavelengths are drawn by the sensor: if the
+film defines sensor response functions (`specfilm`), they are importance
+sampled from the sum of the responses; otherwise from a CIE-based
+distribution over 360–830 nm. **An IR scene must therefore use `specfilm`
+with response functions that cover the band of interest**; a `hdrfilm`
+would (a) sample visible wavelengths and (b) convert to XYZ, giving zero
+for IR radiance.
+
+A single-band film with an ideal response over 8–14 µm:
+
+```python
+'film': {
+    'type': 'specfilm', 'width': 640, 'height': 512,
+    'lwir': {'type': 'regular', 'wavelength_min': 8000, 'wavelength_max': 14000,
+             'values': '1, 1'},
+}
+```
+
+The channel value is ∫ L_λ R(λ) dλ in W m⁻² sr⁻¹ (Section 2.3). Several
+bands can be rendered at once by adding several response spectra; the
+sampler then covers their union. Detector response curves for typical
+InGaAs, InSb/HgCdTe and microbolometer cameras, and a helper that builds
+these film dictionaries, are planned (📝 Phase 4).
+
+> **A8 — Hero-wavelength sampling across the band.** The four path
+> wavelengths are drawn from the film response distribution; all spectral
+> quantities (Planck, optical constants) are evaluated per wavelength.
+
+*Motivation.* This is Mitsuba's native mechanism and is unbiased for any
+response function. Spectral variance is low for smooth integrands (Planck
+over an 8–14 µm band varies by ≈ 1.3×); it becomes relevant for
+line-structured atmospheric transmission (📝 Phase 3), where a spectral
+resolution choice will be documented.
+
+Things that silently do **not** work in the IR and are flagged here:
+
+| Component | Problem | Remedy |
+|---|---|---|
+| `rgb`/`srgb` textures and reflectances | Spectral upsampling is defined on 360–830 nm only | Use `uniform`, `regular`, `irregular` spectra or `.spd` files (`mitsuba.ir.validate` warns) |
+| `hdrfilm` | Converts to XYZ; zero outside the visible | Use `specfilm` |
+| `blackbody` spectrum plugin | Masks wavelengths outside its `wavelength_min/max` (default 360–830 nm) | Set the range, or use `thermal` |
+| Conductor material presets (`material="Al"`, …) | Data cover 360–830 nm only | IR optical constants (Section 6) |
+| `sunsky`/`envmap` | Visible-light models | IR sun and sky models (📝 Phase 3) |
+
+---
+
+## 6. Infrared material data
+
+Visible-light material descriptions do not extrapolate into the infrared
+(Section 1.3). Phase 2 adds optical constants for the materials that
+dominate IR scenes and the means to use measured emissivity spectra.
+All data files live in `resources/ir_data/ior/` with the suffix `_ir`
+(provenance table: `resources/ir_data/ior/README_ir.md`, generator:
+`make_ior_ir.py`) and plug into every conductor BSDF through the existing
+preset mechanism, e.g. `{'type': 'roughconductor', 'material': 'Al_ir', 'alpha': 0.2}`.
+
+### 6.1 Metals: Lorentz–Drude model
+
+> **A9 — Metals follow the Lorentz–Drude model of Rakić et al. (1998).**
+> The complex permittivity is ε(ω) = 1 − f₀ω_p²/(ω² + iΓ₀ω) + Σ_j f_j ω_p² /
+> ((ω_j² − ω²) − iΓ_jω), with the published parameters for Ag, Al, Au, Be,
+> Cr, Cu, Ni, Pd, Pt, Ti and W [28]. The model is evaluated analytically
+> (`mitsuba.ir.drude_lorentz_nk`) and tabulated from 0.3 to 20 µm.
+
+*Motivation.* (i) The LD model is a physically constrained fit to measured
+optical constants over 0.1–6 eV (0.2–12.4 µm) and is the standard
+representation of metals in optics codes; (ii) in the far infrared a metal is
+a Drude conductor, so extrapolating the fit beyond 12.4 µm to 14–20 µm is
+the physically expected behaviour (the Hagen–Rubens limit, ε_n ∝ √(ν/σ)
+[37]); (iii) the parameters were **verified** against the independent
+tabulation of the same model in the refractiveindex.info database [43]:
+maximum relative deviation of n and k over 0.3–12.4 µm is 1.3·10⁻⁴ for all
+eleven metals. The implied normal emissivities at 10 µm (Al 1.2 %, Au 1.3 %,
+Ag 1.1 %, Cu 0.8 %, Fe 2.4 %, Ti 7.3 %) agree with handbook values for
+polished metals [5, 11].
+
+*Caveat (stated to users in the data files).* These are **bulk, clean,
+polished** metals. Real metal surfaces carry oxide layers, contamination and
+roughness that raise the emissivity by up to an order of magnitude (oxidised
+steel 0.6–0.9 [11]). Roughness is modelled with `roughconductor`; oxide
+layers and paints must be described by their own (dielectric or measured)
+material. Iron is not in [28]; `Fe_ir` uses the tabulation of Querry [44].
+
+### 6.2 Dielectrics, windows, water
+
+> **A10 — Smooth absorbing dielectrics are opaque Fresnel interfaces.**
+> Water, glass in the LWIR, sapphire beyond 6 µm, etc. are rendered with the
+> conductor BSDFs, which implement the exact Fresnel equations for a complex
+> index n + ik, i.e. as opaque bodies whose emissivity is 1 − F(θ).
+
+*Motivation.* The penetration depth λ/(4πk) is 16 µm for water at 10 µm
+(k = 0.051 [30]) and 1.4 µm for fused silica at 10 µm (k = 0.55 [47]):
+anything thicker than a few tens of micrometres is opaque and the interface
+alone determines emission and reflection. **Validity limit:** in the SWIR
+water has k ≈ 10⁻⁴ (penetration ≈ 1 mm) and glass k ≈ 10⁻⁶; there, thin
+layers transmit and the opaque model is wrong — a window/medium model must
+be used instead (`window_ior`, and Phase 3 media).
+
+> **A11 — IR windows use a scalar, band-averaged refractive index.** For
+> transparent materials (Ge, Si, ZnSe, ZnS, CaF₂, BaF₂, NaCl, sapphire
+> < 6 µm) Mitsuba's `dielectric`/`roughdielectric` BSDFs take a scalar IOR;
+> `mitsuba.ir.window_ior(material, band)` returns the Planck-weighted band
+> average of n (and of k, so that the caller can check transparency).
+
+*Motivation.* Dispersion within one IR band is small for these materials
+(Ge: 4.03 → 4.00 over 8–14 µm; ZnSe: 2.41 → 2.38), so the error of a scalar
+IOR on Fresnel reflectance is < 0.3 %. Chromatic refraction effects are
+lost, which is irrelevant for radiometric imaging.
+
+Sources (all converted from the public-domain refractiveindex.info database
+[43]; the `.spd` headers carry the full citation): Si [46], Ge [48, 49],
+ZnSe/ZnS/BaF₂/NaCl [45], sapphire and Fe [44], CaF₂ [50], fused silica
+[47], water [30]. Sources that provide only n are transparent in their
+stated range; their k is stored as 10⁻⁸ (Mitsuba rejects all-zero spectra),
+which is radiometrically indistinguishable from zero.
+
+### 6.3 Measured emissivity spectra (ECOSTRESS / ASTER)
+
+> **A12 — Spectral-library materials are Lambertian.** A hemispherical
+> reflectance spectrum ρ(λ) from the ECOSTRESS [9] or ASTER [10] libraries
+> is used as the reflectance of a `diffuse` BSDF; Kirchhoff's law then gives
+> exactly the measured emissivity ε(λ) = 1 − ρ(λ) (`load_ecostress`,
+> `diffuse_from_emissivity`, `diffuse_from_reflectance`).
+
+*Motivation.* The libraries measure directional-hemispherical reflectance
+(10° incidence) with an integrating sphere; the Lambertian interpretation is
+the one used to derive emissivity in the libraries themselves and in land
+surface temperature retrieval [8, 9]. The neglected angular variation of
+emissivity is a few percent up to 60° for most natural surfaces and larger
+for water and smooth man-made surfaces [8], for which the Fresnel models of
+Section 6.2 are preferable. Library files are not redistributed (download
+from https://speclib.jpl.nasa.gov); the loader handles the ASCII format.
+
+### 6.4 Solar source
+
+> **A13 — The sun is a 5772 K blackbody of 1361 W m⁻² total irradiance.**
+> `mitsuba.ir.sun` builds a `directional` emitter with
+> E(λ) = τ(λ)·π B(λ, 5772 K)(R_sun/AU)², where τ(λ) is an optional
+> user-supplied atmospheric transmittance table.
+
+*Motivation.* The IAU nominal solar values [27] give the correct total
+irradiance by construction; the blackbody deviates from the measured
+extraterrestrial spectrum [26] by up to ≈ 10 % in parts of the SWIR
+(Fraunhofer and molecular bands), which can be corrected by passing a
+measured spectrum as τ(λ)·E. Atmospheric transmission (H₂O, CO₂ bands) is
+essential in the MWIR/SWIR and is the subject of Phase 3; until then the
+helper produces top-of-atmosphere sunlight.
+
+---
+
+## 7. Helper library and examples
+
+### 7.1 `mitsuba.ir` (Python)
+
+| Function | Purpose |
+|---|---|
+| `planck`, `planck_dT` | Planck's law and its temperature derivative (W m⁻² sr⁻¹ nm⁻¹) |
+| `band_radiance(lmin, lmax, T, srf)` | ∫ B R dλ, optionally with a detector response |
+| `apparent_temperature(L, lmin, lmax, srf)` | Inverse of the above (brightness temperature), vectorised over images |
+| `BANDS`, `band_range`, `band_film`, `boxcar_srf` | Band definitions and `specfilm` construction (channel = band radiance) |
+| `solar_irradiance_toa`, `sun`, `sky_blackbody` | Sources (Section 6.4; sky as an effective-temperature blackbody until Phase 3) |
+| `thermalize(scene, T, overrides)` | Attach `thermal` emitters to every shape without an emitter (assumption A6) |
+| `validate(scene, band)` | Warn about visible-light constructs: `path`, `hdrfilm`, RGB values, `d65`, non-IR conductor presets, spectra not covering the band, shapes at 0 K |
+| `conductor_ir`, `opaque_ir`, `window_ior`, `load_ior`, `IR_MATERIALS` | Material builders and data access (Section 6) |
+| `drude_lorentz_nk`, `normal_emissivity`, `hemispherical_emissivity`, `fresnel_conductor` | Analytic material physics |
+| `load_ecostress`, `diffuse_from_emissivity`, `diffuse_from_reflectance` | Spectral-library workflow (Section 6.3) |
+| `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
+
+### 7.2 Examples (`examples/ir/`)
+
+| Script | Demonstrates | Key result |
+|---|---|---|
+| `01_lwir_basic.py` | Thermal emitters, `thermalize`, Kirchhoff coupling, band film, apparent temperature | Rough-Al box at 300 K reads 275 K on top (mirrors the 250 K sky) and 289 K on the side |
+| `02_bands.py` | Same scene in SWIR/MWIR/LWIR with sunlight; separation of reflected and emitted components | Thermal share of the image: SWIR 0.0 %, MWIR 45.7 %, LWIR 99.8 % — the regimes of Table 1 |
+| `03_materials.py` | `*_ir` presets; six spheres at 320 K | Apparent temperatures: matte paint 317.9 K, polished Al 288.0 K, polished Fe 288.3 K, water 319.6 K, glass 314.6 K |
+| `04_kirchhoff_checks.py` | Rendered vs. analytic radiance | All cases within 2.6·10⁻⁴ (Section 8) |
+| `05_temperature_texture.py` | Temperature field as a raw float bitmap | Hot spot 340 K with ε = 0.9 under a 260 K sky: rendered 334.5 K vs. expected 334.0 K |
+| `06_ecostress.py` | Measured reflectance spectra as Lambertian IR materials | Rendered radiance equals ε_band·B to 0.07 % |
+
+---
+
+## 8. Validation
+
+Each test in `src/integrators/tests/test_path_ir.py` compares a
+band-integrated radiance to a closed-form reference derived from Planck's
+law and Kirchhoff's law. Tests run on every spectral variant that was
+built (`scalar_spectral`, `llvm_ad_spectral`, `cuda_ad_spectral`).
+
+| Test | Configuration | Reference | Tolerance | Status |
+|---|---|---|---|---|
+| `test01` | Diffuse plate (ρ=0.3, 300 K), black background | (1−ρ) B | 0.2 % (zero-variance case) | ✅ |
+| `test01` (b) | Same with `path` integrator | B (documents the non-thermal-aware behaviour) | 0.2 % | ✅ |
+| `test02` | Camera inside isothermal specular-conductor sphere | B | 0.2 % (zero variance) | ✅ |
+| `test03` | Camera inside isothermal diffuse sphere (ρ=0.7) | B | 1.5 % (MIS noise) | ✅ |
+| `test04` | Diffuse plate (320 K) inside blackbody cavity (280 K) | (1−ρ) B(T₁) + ρ B(T₂) | 1.5 % | ✅ |
+| `test05` | Conductor plate (n=3, k=4) at 0°, 45°, 75° | (1 − F(θ)) B — directional Kirchhoff | 0.3 % | ✅ |
+| `test06` | Blackbody plate, 8–14 µm band | 54.93 W m⁻² sr⁻¹ | 1 % | ✅ |
+| `test07` | Thermal diffuse plate + directional source (MWIR) | (1−ρ) B + ρ E/π | 0.5 % (sun `sampling_weight` 10⁴) | ✅ |
+
+Phase 2 adds `src/python_tests/test_ir.py` (13 tests on all spectral variants):
+
+| Test | Check | Reference |
+|---|---|---|
+| `test01` | Stefan–Boltzmann integral, Wien's law, LWIR band value 54.93, dB/dT | σT⁴/π, b/T [5] |
+| `test02` | Apparent-temperature inversion round-trips in SWIR/MWIR/LWIR, with a Gaussian response | — |
+| `test03` | ∫E_sun dλ = 1361 W m⁻² | IAU 2015 [27] |
+| `test04` | LD normal emissivities of Al/Au/Ag/Cu/W at 10 µm in 0.3–3 %; LD vs. shipped Johnson–Christy Au data in the visible (< 15 %) | [28, 37] |
+| `test05` | All 22 `*_ir` presets load in `conductor`; the sampled Fresnel weight of `Al_ir` equals the Fresnel formula from the data | — |
+| `test06` | Band-averaged n of Ge (≈ 4.0), ZnSe (≈ 2.4); water opaque in the LWIR | [48, 45, 30] |
+| `test07` | `validate` flags `path`, `hdrfilm`, RGB, visible presets, untagged shapes; `thermalize` semantics | — |
+| `test08` | Sun on a diffuse plate gives ρE/π with the physically scaled spectrum | — |
+| `test09` | ECOSTRESS parser (units, ordering) and material construction | [9] |
+
+**Convergence study** (isothermal cavity, L/B, 4 seeds): diffuse wall is
+exactly 1.0000 at any sample count (zero variance, as derived in Section
+3.2); rough Al (α = 0.3): 0.998 ± 0.011 at 256 spp, 1.003 ± 0.001 at 4096,
+1.002 ± 0.002 at 32 768 spp; rough Al (α = 0.05): 1.007 ± 0.001 at 32 768 spp.
+The residual of ≈ 0.5 % for the near-specular rough conductor over 64-bounce
+paths is above the statistical error and is noted as an open item (suspected
+single-precision effects in the microfacet eval/pdf ratio at grazing
+incidence; it does not affect diffuse or smooth materials).
+
+`src/emitters/tests/test_thermal.py` checks the emitter in isolation:
+Planck values at 250–1500 K, two-sidedness, agreement with the existing
+`blackbody` spectrum, textured temperature, and the consistency of
+`sample_direction`/`pdf_direction`/`eval_direction`.
+
+**Results (2026-11-12, all three spectral variants):** 53/53 tests pass
+(26 emitter tests, 27 integrator tests). Observed accuracy in the
+zero-variance configurations is limited only by single-precision Planck
+evaluation and the 20 nm test band (< 0.1 %).
+
+A practical lesson from `test07`: with uniform emitter selection and two
+emitters, the solar term of each sample is either 0 or twice its mean,
+giving a relative standard error of 1/√spp (6 % at 256 spp). In scenes where
+every surface emits, strong non-thermal sources (sun, hot exhausts) must be
+given a correspondingly large `sampling_weight`; see Section 4.4.
+
+---
+
+## 9. Limitations and roadmap
+
+| Phase | Content | Status |
+|---|---|---|
+| 1 | Thermal emission of surfaces, Kirchhoff coupling, `path_ir`, validation | ✅ |
+| 2 | IR material data (Section 6), `mitsuba.ir` helpers, examples | ✅ |
+| 3 | Atmosphere: emissive/absorbing media (`volpath_ir`) [36], sun as 5772 K source with ASTM G173 spectrum [26], clear-sky LWIR model [32, 33]; user-supplied transmittance spectra (e.g. from MODTRAN/HITRAN [34, 35]) | 📝 |
+| 4 | Sensor model: detector response curves [40], apparent-temperature output, NETD noise model | 📝 |
+| 5 | Polarized thermal emission; multiple-scattering microfacet BSDFs [22]; differentiable temperature | 📝 |
+
+Known limitations of the present state:
+
+* No participating media (atmosphere, exhaust plumes) — `path_ir` ignores
+  media like `path` does.
+* Emissivity of rough surfaces follows the single-scattering microfacet
+  models (A5).
+* Uniform emitter selection for next-event estimation (Section 4.4).
+* Material data cover clean bulk materials; paints, oxides, vegetation,
+  soils and fabrics must come from spectral libraries (Section 6.3) or user
+  measurements. Only hemispherical (Lambertian) use of library data is
+  supported; measured BRDFs are not.
+* `sun` has no atmosphere; `sky_blackbody` is isotropic (Phase 3).
+* Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
+
+---
+
+## 10. References
+
+[1] M. Planck, "Ueber das Gesetz der Energieverteilung im Normalspectrum," *Annalen der Physik* 309(3), 553–563, 1901.
+
+[2] G. Kirchhoff, "Ueber das Verhältniss zwischen dem Emissionsvermögen und dem Absorptionsvermögen der Körper für Wärme und Licht," *Annalen der Physik* 185(2), 275–301, 1860.
+
+[3] F. E. Nicodemus, "Directional reflectance and emissivity of an opaque surface," *Applied Optics* 4(7), 767–775, 1965.
+
+[4] F. E. Nicodemus, J. C. Richmond, J. J. Hsia, I. W. Ginsberg, T. Limperis, *Geometrical Considerations and Nomenclature for Reflectance*, NBS Monograph 160, National Bureau of Standards, 1977.
+
+[5] J. R. Howell, M. P. Mengüç, R. Siegel, *Thermal Radiation Heat Transfer*, 6th ed., CRC Press, 2016.
+
+[6] M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Academic Press, 2013.
+
+[7] J. R. Howell, "The Monte Carlo method in radiative heat transfer," *Journal of Heat Transfer* 120(3), 547–560, 1998.
+
+[8] W. C. Snyder, Z. Wan, "BRDF models to predict spectral reflectance and emissivity in the thermal infrared," *IEEE Transactions on Geoscience and Remote Sensing* 36(1), 214–225, 1998.
+
+[9] S. K. Meerdink, S. J. Hook, D. A. Roberts, E. A. Abbott, "The ECOSTRESS spectral library version 1.0," *Remote Sensing of Environment* 230, 111196, 2019.
+
+[10] A. M. Baldridge, S. J. Hook, C. I. Grove, G. Rivera, "The ASTER spectral library version 2.0," *Remote Sensing of Environment* 113(4), 711–715, 2009.
+
+[11] M. Vollmer, K.-P. Möllmann, *Infrared Thermal Imaging: Fundamentals, Research and Applications*, 2nd ed., Wiley-VCH, 2018.
+
+[12] C. J. Willers, *Electro-Optical System Analysis and Design: A Radiometry Perspective*, SPIE Press, 2013.
+
+[13] R. D. Hudson, *Infrared System Engineering*, Wiley, 1969.
+
+[14] ISO 20473:2007, *Optics and photonics — Spectral bands*, International Organization for Standardization, 2007.
+
+[15] W. Jakob, S. Speierer, N. Roussel, M. Nimier-David, D. Vicini, T. Zeltner, B. Nicolet, M. Crespo, V. Leroy, Z. Zhang, *Mitsuba 3 renderer*, version 3.x, https://mitsuba-renderer.org, 2022.
+
+[16] W. Jakob, S. Speierer, N. Roussel, D. Vicini, "Dr.Jit: A just-in-time compiler for differentiable rendering," *ACM Transactions on Graphics* 41(4), 2022.
+
+[17] A. Wilkie, S. Nawaz, M. Droske, A. Weidlich, J. Hanika, "Hero wavelength spectral sampling," *Computer Graphics Forum* 33(4), 123–131, 2014.
+
+[18] E. Veach, L. J. Guibas, "Optimally combining sampling techniques for Monte Carlo rendering," *Proc. SIGGRAPH '95*, 419–428, 1995.
+
+[19] J. T. Kajiya, "The rendering equation," *Proc. SIGGRAPH '86*, 143–150, 1986.
+
+[20] Bureau International des Poids et Mesures, *The International System of Units (SI)*, 9th ed., 2019 (exact values of h, c, k_B).
+
+[21] E. Heitz, "Understanding the masking-shadowing function in microfacet-based BRDFs," *Journal of Computer Graphics Techniques* 3(2), 48–107, 2014.
+
+[22] E. Heitz, J. Hanika, E. d'Eon, C. Dachsbacher, "Multiple-scattering microfacet BSDFs with the Smith model," *ACM Transactions on Graphics* 35(4), 2016.
+
+[23] B. Walter, S. R. Marschner, H. Li, K. E. Torrance, "Microfacet models for refraction through rough surfaces," *Proc. Eurographics Symposium on Rendering*, 195–206, 2007.
+
+[24] J. R. Schott, *Remote Sensing: The Image Chain Approach*, 2nd ed., Oxford University Press, 2007.
+
+[25] A. A. Goodenough, S. D. Brown, "DIRSIG5: Next-generation remote sensing data and image simulation framework," *IEEE Journal of Selected Topics in Applied Earth Observations and Remote Sensing* 10(11), 4818–4833, 2017.
+
+[26] C. A. Gueymard, "The sun's total and spectral irradiance for solar energy applications and solar radiation models," *Solar Energy* 76(4), 423–453, 2004.
+
+[27] A. Prša et al., "Nominal values for selected solar and planetary quantities: IAU 2015 Resolution B3," *The Astronomical Journal* 152(2), 41, 2016 (nominal solar effective temperature 5772 K).
+
+[28] A. D. Rakić, A. B. Djurišić, J. M. Elazar, M. L. Majewski, "Optical properties of metallic films for vertical-cavity optoelectronic devices," *Applied Optics* 37(22), 5271–5283, 1998.
+
+[29] M. A. Ordal, L. L. Long, R. J. Bell, S. E. Bell, R. R. Bell, R. W. Alexander, C. A. Ward, "Optical properties of the metals Al, Co, Cu, Au, Fe, Pb, Ni, Pd, Pt, Ag, Ti, and W in the infrared and far infrared," *Applied Optics* 22(7), 1099–1119, 1983.
+
+[30] G. M. Hale, M. R. Querry, "Optical constants of water in the 200-nm to 200-µm wavelength region," *Applied Optics* 12(3), 555–563, 1973.
+
+[31] R. Kitamura, L. Pilon, M. Jonasz, "Optical constants of silica glass from extreme ultraviolet to far infrared at near room temperature," *Applied Optics* 46(33), 8118–8133, 2007.
+
+[32] S. B. Idso, "A set of equations for full spectrum and 8- to 14-µm and 10.5- to 12.5-µm thermal radiation from cloudless skies," *Water Resources Research* 17(2), 295–304, 1981.
+
+[33] M. H. Unsworth, J. L. Monteith, "Long-wave radiation at the ground: I. Angular distribution of incoming radiation," *Quarterly Journal of the Royal Meteorological Society* 101(427), 13–24, 1975.
+
+[34] A. Berk, P. Conforti, R. Kennett, T. Perkins, F. Hawes, J. van den Bosch, "MODTRAN6: a major upgrade of the MODTRAN radiative transfer code," *Proc. SPIE* 9088, 90880H, 2014.
+
+[35] I. E. Gordon et al., "The HITRAN2020 molecular spectroscopic database," *Journal of Quantitative Spectroscopy and Radiative Transfer* 277, 107949, 2022.
+
+[36] J. Novák, I. Georgiev, J. Hanika, W. Jarosz, "Monte Carlo methods for volumetric light transport simulation," *Computer Graphics Forum* 37(2), 551–576, 2018.
+
+[37] E. Hagen, H. Rubens, "Über Beziehungen des Reflexions- und Emissionsvermögens der Metalle zu ihrem elektrischen Leitvermögen," *Annalen der Physik* 316(8), 873–901, 1903.
+
+[38] G. F. Evans, M. D. McCool, "Stratified wavelength clusters for efficient spectral Monte Carlo rendering," *Proc. Graphics Interface*, 42–49, 1999.
+
+[39] M. N. Polyanskiy, "Refractiveindex.info database of optical constants," *Scientific Data* 11, 94, 2024. *(also cited as [43])*
+
+[40] A. Rogalski, *Infrared Detectors*, 2nd ed., CRC Press, 2011.
+
+[41] M. Cherkaoui, J.-L. Dufresne, R. Fournier, J.-Y. Grandpeix, A. Lahellec, "Monte Carlo simulation of radiation in gases with a narrow-band model and a net-exchange formulation," *Journal of Heat Transfer* 118(2), 401–407, 1996.
+
+[42] K. Johnson, A. Curran, D. Less, D. Levanen, E. Marttila, T. Gonda, J. Jones, "MuSES: A new heat and signature management design tool for virtual prototyping," *Proc. 9th Annual Ground Target Modeling & Simulation Conference*, 1998.
+
+[43] M. N. Polyanskiy, "Refractiveindex.info database of optical constants," *Scientific Data* 11, 94, 2024. Database: https://refractiveindex.info (CC0 1.0).
+
+[44] M. R. Querry, *Optical Constants*, Contractor Report CRDC-CR-85034, U.S. Army Chemical Research and Development Center, 1985.
+
+[45] M. R. Querry, *Optical Constants of Minerals and Other Materials from the Millimeter to the Ultraviolet*, Contractor Report CRDEC-CR-88009, 1987.
+
+[46] D. Franta, A. Dubroka, C. Wang, A. Giglia, J. Vohánka, P. Franta, I. Ohlídal, "Temperature-dependent dispersion model of float zone crystalline silicon," *Applied Surface Science* 421, 405–419, 2017.
+
+[47] D. Franta, D. Nečas, I. Ohlídal, A. Giglia, "Optical characterization of SiO₂ thin films using universal dispersion model over wide spectral range," *Proc. SPIE* 9890, 989014, 2016.
+
+[48] J. H. Burnett, S. G. Kaplan, E. Stover, A. Phenis, "Refractive index measurements of Ge," *Proc. SPIE* 9974, 99740X, 2016.
+
+[49] T. Amotchkina, M. Trubetskov, D. Hahner, V. Pervak, "Characterization of e-beam evaporated Ge, YbF₃, ZnS, and LaF₃ thin films for laser-oriented coatings," *Applied Optics* 59(5), A40–A47, 2020.
+
+[50] H. H. Li, "Refractive index of alkaline earth halides and its wavelength and temperature derivatives," *Journal of Physical and Chemical Reference Data* 9(1), 161–289, 1980.
+
+---
+
+## Appendix A — Changelog
+
+| Date | Version | Change |
+|---|---|---|
+| 2026-11-12 | 0.2 | Phase 2: `*_ir` optical constants (22 presets, Lorentz–Drude metals verified to 1.3·10⁻⁴ against [43]; dielectrics/water from [43]), `mitsuba.ir` package (radiometry, materials, scene helpers), 13 new tests, `examples/ir/` (6 scripts), assumptions A9–A13, convergence study. |
+| 2026-11-12 | 0.1 | Phase 1: `EmitterFlags::Thermal`, `Integrator::thermal_aware()`, `thermal` emitter, `path_ir` integrator, scene-level compatibility warning, unit and validation tests, this report. |
+
+## Appendix B — Build notes
+
+* Built from a fresh recursive clone with Clang 23 / Ninja, `CMAKE_BUILD_TYPE=Release`,
+  variants `scalar_rgb`, `scalar_spectral`, `llvm_ad_spectral`, `cuda_ad_spectral`
+  (`build/mitsuba.conf`), `MI_SPLIT_MODE=OFF`.
+* `cmake` is taken from a project-local virtual environment (`.venv-build`,
+  created with `uv`), which also provides `pytest` and `numpy`.
+* The configure step is run with `-DMI_NANOBIND_FOUND=0` because a system
+  `nanobind` package is installed; Mitsuba's bundled copy is first on the
+  include path and is the one actually compiled against.
+* Run tests with `source build/setpath.sh && pytest src/emitters/tests/test_thermal.py src/integrators/tests/test_path_ir.py`.
