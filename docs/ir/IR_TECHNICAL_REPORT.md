@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.3.1 — Phase 3 (emissive atmosphere: media, sky, HITRAN transmittance + continuum) |
+| **Version** | 0.4 — Phase 3b (scene temperatures from a surface energy balance) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -705,6 +705,128 @@ fixed mixing ratios, and any vertical structure; slant paths through the
 whole atmosphere require a layered model (MODTRAN-type), whose output can be
 passed to `air_medium`/`sun`.
 
+### 6.8 Scene temperatures from a surface energy balance (`mitsuba.ir.thermal`)
+
+An infrared image is only as good as the temperatures it is rendered from.
+`mitsuba.ir.thermal` computes them for outdoor scenes from a single
+parametrised weather description, including the shadows cast by the scene
+geometry. The approach is the one used by signature-prediction codes
+(PRISM, MuSES [42], DIRSIG's thermal model [25]) and in the thermal
+remote-sensing literature [24, 56]: every surface sample point owns a
+one-dimensional transient conduction problem whose surface boundary
+condition is the net radiative-convective flux.
+
+> **A17 — One-dimensional conduction per surface element.** Each sampled
+> point of a shape (a UV-grid texel, or a vertex for meshes without UVs)
+> is a column of finite volumes in depth: semi-infinite (ground, modelled
+> to 1 m with geometrically growing cells and a fixed deep temperature
+> equal to the daily mean air temperature) or a slab of given thickness
+> (walls, sheet metal, leaves) whose back is adiabatic, exposed to air, or
+> coupled to an interior temperature through a conductance. Lateral
+> conduction between elements is neglected.
+
+*Motivation.* For the diurnal cycle the thermal penetration depth
+δ = √(2a/ω) is ≈ 0.1 m for asphalt and concrete and ≈ 0.05 m for dry soil
+[57], much smaller than the lateral extent of the features that produce
+IR contrast (shadows, objects), so heat flows essentially normal to the
+surface; this is the standard assumption of terrain temperature models
+[56, 58]. Thin metal skins are nearly isothermal through their thickness
+and are treated as lumped slabs (two nodes). The solver is backward Euler
+with the T⁴ term linearised about the previous step (radiative coefficient
+4εσT³) and a vectorised Thomas algorithm; it is unconditionally stable, so
+5-minute steps are used. Validation (`test_ir_thermal.py`): steady-state
+energy balance reproduced to 10⁻³ K; the Carslaw–Jaeger amplitude decay
+e^{−z/δ} of a sinusoidally forced semi-infinite solid reproduced to 1 % at
+three depths.
+
+> **A18 — Surface energy balance.** The surface node receives
+> q = α_s [E_dn cos θ_i V + F_sky E_dh + (1 − F_sky) ρ_g E_gh] + ε [F_sky L_sky
+> + (1 − F_sky) σT_sur⁴ − σT_s⁴] + h (T_air − T_s) + q_int, where V ∈ {0, 1} is
+> the solar visibility of the element (shadow ray through the scene),
+> F_sky the cosine-weighted sky-view factor (stratified hemisphere rays
+> through the scene), α_s the broadband solar absorptance, ε the broadband
+> longwave emissivity, h = 5.7 + 3.8 u (McAdams/Jürges [59]), T_sur the
+> temperature of the unresolved surroundings (default: air temperature)
+> and q_int an optional internal flux.
+
+*Motivation.* The radiative terms are the standard decomposition of
+incident shortwave into direct, sky-diffuse and ground-reflected parts and
+of longwave into sky and terrain parts weighted by the sky-view factor
+[24, 56, 60]; obtaining V and F_sky by ray casting through the actual
+scene (Section 6.8.1) is what produces geometrically correct *thermal
+shadows*. Multiple shortwave reflections and the longwave exchange between
+resolved scene surfaces are linearised to an environment at T_air; this is
+the usual first-order treatment [56] and errs mostly for deep courtyards and
+under dense canopies. Evapotranspiration (vegetation, wet soil) and
+precipitation are not modelled; `MATERIALS['grass']` and
+`['vegetation_canopy']` therefore run warmer than real transpiring
+vegetation in the afternoon. Broadband α_s and ε are material parameters
+(table in `heat.MATERIALS`, values after Oke [57], Incropera [61] and
+Jacobs [56]); the *spectral* emissivity used for rendering still comes from
+the BSDF (A3) — the user is responsible for choosing consistent pairs
+(e.g. a paint BSDF with ε ≈ 0.9 for `steel_sheet_painted`).
+
+> **A19 — One parametrised weather model with a periodic diurnal cycle.**
+> `Weather(date, latitude, longitude, utc_offset, T_min, T_max,
+> relative_humidity, wind_speed, cloud_cover, aod500, pressure, ground_albedo)`
+> provides: solar position by Michalsky's algorithm [62]; clear-sky direct
+> and diffuse irradiance by Bird & Hulstrom [63] with precipitable water
+> from the surface humidity (Leckner [64]); cloud correction by Kasten &
+> Czeplak [65]; air temperature by Parton & Logan [66] (minimum at sunrise,
+> maximum 1.86 h after the sinusoidal peak, exponential night cooling);
+> sky longwave by Idso [32] with Crawford & Duchon's cloud correction [67].
+> The same day is repeated for the spin-up (3 days by default).
+
+*Motivation.* These are the simplest published models that capture the
+first-order behaviour of each quantity with a handful of physically named
+parameters, each validated against measurements in its source; they are
+the models behind many engineering tools (Bird: NREL; Parton–Logan: crop
+and soil models; Kasten–Czeplak: solar-energy practice). Validation in
+`test_ir_thermal.py`: solar elevation at the solstices to 0.15°, azimuth
+to 1°; Bird clear-sky noon values (DNI 924, DHI 115, GHI 1039 W m⁻² for
+AOD 0.1, W = 1.5 cm); sunrise/sunset of Stockholm in July to 0.5 h.
+Periodic forcing is a modelling choice: the solver needs a spun-up state,
+and a realistic multi-day sequence can be obtained by chaining `Weather`
+objects (planned).
+
+> **A20 — Internal heat sources.** A per-material internal flux
+> `q_internal` [W m⁻²] at the back node and/or an interior temperature
+> `T_internal` coupled through `U_internal` [W m⁻² K⁻¹] represent engines,
+> heated buildings, electronics.
+
+*Motivation.* Both forms occur in practice (a known dissipated power per
+area; a known interior temperature behind a skin of known thermal
+resistance); they are validated against the closed-form equilibrium in
+`test04` (q = 200 W m⁻² and U → ∞).
+
+#### 6.8.1 Shadows and sky view from the scene
+
+`ThermalScene` loads the user's scene (sensors, integrators and emitters
+stripped) and samples each simulated shape on a UV grid through
+`Shape::eval_parameterization` (meshes without UVs fall back to their
+vertices). For every 5-minute step with the sun above the horizon a shadow
+ray is cast from each element towards the sun (`Scene::ray_test`,
+vectorised); elements facing away or occluded receive no direct
+irradiance. The sky-view factor F_sky is the cosine-weighted fraction of
+128 stratified (Hammersley) hemisphere directions, randomly rotated per
+element, that reach the sky. Objects not simulated (no material given)
+still cast shadows. Cost: 33 000 elements × 3 days at 5-minute steps run
+in ≈ 5 s on 12 cores (`examples/ir/10_thermal_solver.py`).
+
+#### 6.8.2 Output
+
+`ThermalResult.temperature(key, t)` returns the surface temperature field
+of a shape at an output time; `texture(key, t)` wraps it as a raw float
+bitmap texture; `apply(scene_dict, t)` returns a copy of the scene in which
+each simulated shape carries a `thermal` emitter with that texture, ready
+for `path_ir`/`volpath_ir` (Section 7.2, example 10). Example 10 shows the
+expected behaviour for Stockholm on 15 July: open asphalt 16 °C at 05:00 →
+49 °C at 14:00 → 22 °C at 23:00 (air 14–26 °C), asphalt 0.8 m west of a
+wall shaded in the morning lagging the open ground by 16 K at 11:00 and
+still by 4 K at 14:00 after the shadow has moved (the thermal shadow), a 2
+mm steel box over a 60 °C compartment staying at 30–40 °C through the
+night, and a leaf canopy following the air temperature closely.
+
 ---
 
 ## 7. Helper library and examples
@@ -725,6 +847,9 @@ passed to `air_medium`/`sun`.
 | `load_ecostress`, `diffuse_from_emissivity`, `diffuse_from_reflectance` | Spectral-library workflow (Section 6.3) |
 | `sky_emissivity_idso`, `vapour_pressure`, `thermalsky` | Clear-sky emissivity and `thermalsky` emitter dictionaries (Section 6.6) |
 | `air_medium`, `medium_box`, `hitran_absorption`, `transmittance`, `atmosphere.band_average` | Emissive air media and HITRAN line-by-line absorption (Sections 6.5, 6.7) |
+| `thermal.Weather`, `thermal.solar_position`, `thermal.bird_clear_sky` | Parametrised weather and solar forcing (Section 6.8, A19) |
+| `thermal.Material`, `thermal.MATERIALS`, `thermal.Column` | Thermal material properties and the 1-D solver (A17, A18, A20) |
+| `thermal.ThermalScene`, `thermal.ThermalResult` | Scene sampling, shadows, sky view, time integration, temperature textures (Section 6.8.1–2) |
 | `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
 
 ### 7.2 Examples (`examples/ir/`)
@@ -740,6 +865,7 @@ passed to `air_medium`/`sun`.
 | `07_atmosphere.py` | `volpath_ir` with an emissive air layer of 10 m–10 km in front of a 350 K plate (gray or `--hitran` absorption) | Matches τ L_up + (1−τ) B_air (hemispherical slab term for L_down) to < 0.3 % at short range, ≤ 2 % at 10 km (Monte Carlo noise, 1024 spp) |
 | `08_sky.py` | `thermalsky` angular radiance; polished Al plate mirroring the sky | Sky 245 K (zenith) → 293 K (horizon); 300 K Al plate reads 245–293 K depending on tilt |
 | `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km, 2.5–5.5 and 6.5–15.5 µm, with/without RSB continuum; attenuated sun and air medium | Window edges at 7.5–8 µm (H₂O) and 13.5–14 µm (CO₂), CO₂ 4.3 µm band opaque, continuum slope in the window |
+| `10_thermal_solver.py` | `mitsuba.ir.thermal`: asphalt, concrete wall, heated steel box, tree in Stockholm on 2026-07-15; probes through the day, LWIR renders at 08/14/20 h, diurnal curves | Moving optical shadows with lagging thermal shadows; asphalt 16–49 °C, wall 18–27 °C, box 30–40 °C |
 
 ---
 
@@ -790,6 +916,17 @@ Phase 3 adds `src/integrators/tests/test_volpath_ir.py` (9 tests) and
 | `volpath_ir/test08` | Wavelength-dependent σ_a (irregular spectrum) | ∫ e^{−σ(λ)d} B dλ | 2 % |
 | `thermalsky/test01–05` | Zenith/horizon/below-horizon values, isotropic model, `up` vector, spectral ε_z, sampling consistency, conductor plate reflecting the zenith (F(0) ε_z B) | closed forms | ≤ 0.3 % |
 
+Phase 3b adds `src/python_tests/test_ir_thermal.py` (7 tests):
+
+| Test | Check | Reference |
+|---|---|---|
+| `test01` | Solar elevation/azimuth at both solstices (Stockholm, Sydney), vectorised call, `sun_direction` frame conventions | 90° − φ ± δ; [62] |
+| `test02` | Bird clear-sky noon values, air-mass dependence, aerosol and cloud sensitivities | [63, 65] |
+| `test03` | Sunrise/sunset, T_min/T_max reproduction and afternoon maximum, irradiance and sky longwave ranges, h, precipitable water | [66, 32] |
+| `test04` | Steady-state slab with 0/300/800 W m⁻² absorbed; internal flux; interior boundary | energy balance (Newton) |
+| `test05` | Periodic penetration into a semi-infinite solid at three depths | e^{−z/δ}, Carslaw & Jaeger |
+| `test06` | Roof over asphalt: F_sky under the roof < 0.3, thermal shadow > 10 K at noon, lag (15:00 warmer than 12:00, evening warmer than air), texture round trip and `path_ir` render | — |
+
 **Convergence study** (isothermal cavity, L/B, 4 seeds): diffuse wall is
 exactly 1.0000 at any sample count (zero variance, as derived in Section
 3.2); rough Al (α = 0.3): 0.998 ± 0.011 at 256 spp, 1.003 ± 0.001 at 4096,
@@ -824,6 +961,7 @@ given a correspondingly large `sampling_weight`; see Section 4.4.
 | 1 | Thermal emission of surfaces, Kirchhoff coupling, `path_ir`, validation | ✅ |
 | 2 | IR material data (Section 6), `mitsuba.ir` helpers, examples | ✅ |
 | 3 | Emissive media (`volpath_ir`, medium `temperature`), `thermalsky`, Idso clear-sky emissivity, HITRAN transmittance | ✅ |
+| 3b | Scene temperatures: `mitsuba.ir.thermal` energy-balance solver with scene shadows, parametrised weather, internal heat | ✅ |
 | 4 | Sensor model: detector response curves [40], apparent-temperature output, NETD noise model | 📝 |
 | 5 | Polarized thermal emission; multiple-scattering microfacet BSDFs [22]; differentiable temperature | 📝 |
 
@@ -840,6 +978,9 @@ Known limitations of the present state:
   no clouds, horizontal homogeneous paths only (A15, A16); the sky is an
   isothermal slab at the screen-level air temperature.
 * Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
+* Thermal solver: no lateral conduction, no evapotranspiration or
+  precipitation, surroundings linearised to T_air, periodic single-day
+  forcing, broadband α_s/ε separate from the rendering BSDF (A17–A20).
 
 ---
 
@@ -955,12 +1096,37 @@ Known limitations of the present state:
 
 [55] R. E. Roberts, J. E. A. Selby, L. M. Biberman, "Infrared continuum absorption by atmospheric water vapor in the 8–12-µm window," *Applied Optics* 15(9), 2085–2090, 1976.
 
+[56] P. A. Jacobs, *Thermal Infrared Characterization of Ground Targets and Backgrounds*, 2nd ed., SPIE Press, 2006.
+
+[57] T. R. Oke, *Boundary Layer Climates*, 2nd ed., Routledge, 1987 (Table 2.1: thermal properties of natural and urban materials).
+
+[58] L. K. Balick, L. E. Link, R. K. Scoggins, J. L. Solomon, *Thermal Modeling of Terrain Surface Elements*, Technical Report EL-81-2, U.S. Army Engineer Waterways Experiment Station, 1981.
+
+[59] W. H. McAdams, *Heat Transmission*, 3rd ed., McGraw-Hill, 1954; as used in J. A. Duffie, W. A. Beckman, *Solar Engineering of Thermal Processes*, 4th ed., Wiley, 2013 (h = 5.7 + 3.8 V).
+
+[60] F. Lindberg, B. Holmer, S. Thorsson, "SOLWEIG 1.0 – Modelling spatial variations of 3D radiant fluxes and mean radiant temperature in complex urban settings," *International Journal of Biometeorology* 52, 697–713, 2008.
+
+[61] T. L. Bergman, A. S. Lavine, F. P. Incropera, D. P. DeWitt, *Fundamentals of Heat and Mass Transfer*, 7th ed., Wiley, 2011.
+
+[62] J. J. Michalsky, "The Astronomical Almanac's algorithm for approximate solar position (1950–2050)," *Solar Energy* 40(3), 227–235, 1988.
+
+[63] R. E. Bird, R. L. Hulstrom, *A Simplified Clear Sky Model for Direct and Diffuse Insolation on Horizontal Surfaces*, SERI/TR-642-761, Solar Energy Research Institute, 1981.
+
+[64] B. Leckner, "The spectral distribution of solar radiation at the earth's surface—elements of a model," *Solar Energy* 20(2), 143–150, 1978.
+
+[65] F. Kasten, G. Czeplak, "Solar and terrestrial radiation dependent on the amount and type of cloud," *Solar Energy* 24(2), 177–189, 1980.
+
+[66] W. J. Parton, J. A. Logan, "A model for diurnal variation in soil and air temperature," *Agricultural Meteorology* 23, 205–216, 1981.
+
+[67] T. M. Crawford, C. E. Duchon, "An improved parameterization for estimating effective atmospheric emissivity for use in calculating daytime downwelling longwave radiation," *Journal of Applied Meteorology* 38(4), 474–480, 1999.
+
 ---
 
 ## Appendix A — Changelog
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-12 | 0.4 | Phase 3b: `mitsuba.ir.thermal` (solar geometry, Bird clear sky, parametrised weather, 1-D energy-balance solver with scene shadows and sky-view factors, materials table, temperature textures), 7 tests, example 10, assumptions A17–A20, references [56]–[67]. |
 | 2026-11-12 | 0.3.1 | Atmosphere: RSB water-vapour continuum added to `hitran_absorption` (default on), grid step 0.05 cm⁻¹, example 09 extended beyond the band edges; A16 and §6.7 revised after review of the transmittance figure. |
 | 2026-11-12 | 0.3 | Phase 3: medium `temperature`, `volpath_ir` (difference formulation for emissive media), `thermalsky` emitter, `mitsuba.ir.atmosphere` (Idso emissivity, air media, HITRAN line-by-line via hapi), 14 new tests, examples 07–09, assumptions A14–A16, references [51]–[54]. |
 | 2026-11-12 | 0.2 | Phase 2: `*_ir` optical constants (22 presets, Lorentz–Drude metals verified to 1.3·10⁻⁴ against [43]; dielectrics/water from [43]), `mitsuba.ir` package (radiometry, materials, scene helpers), 13 new tests, `examples/ir/` (6 scripts), assumptions A9–A13, convergence study. |

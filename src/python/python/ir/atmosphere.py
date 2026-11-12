@@ -37,8 +37,8 @@ def sky_emissivity_idso(T_air, e_a, band='full'):
     bands outside the window are nearly opaque). Use the ``'8-14'`` value
     as ``emissivity_zenith`` of a LWIR ``thermalsky``.
     """
-    T = float(T_air)
-    e = float(e_a)
+    T = np.asarray(T_air, dtype=np.float64)
+    e = np.asarray(e_a, dtype=np.float64)
     if band == 'full':
         eps = 0.70 + 5.95e-5 * e * np.exp(1500.0 / T)
     elif band in ('8-14', 'lwir'):
@@ -47,18 +47,21 @@ def sky_emissivity_idso(T_air, e_a, band='full'):
         eps = 0.10 + 3.53e-8 * e**2 * np.exp(3000.0 / T)
     else:
         raise ValueError("band must be 'full', '8-14' or '10.5-12.5'")
-    return float(np.clip(eps, 0.0, 1.0))
+    eps = np.clip(eps, 0.0, 1.0)
+    return float(eps) if eps.ndim == 0 else eps
 
 
 def saturation_vapour_pressure(T_air):
     """Saturation water vapour pressure over water [hPa] (Magnus formula, WMO 2008)."""
-    t = float(T_air) - 273.15
-    return 6.112 * np.exp(17.62 * t / (243.12 + t))
+    t = np.asarray(T_air, dtype=np.float64) - 273.15
+    es = 6.112 * np.exp(17.62 * t / (243.12 + t))
+    return float(es) if es.ndim == 0 else es
 
 
 def vapour_pressure(T_air, relative_humidity):
     """Water vapour pressure [hPa] from temperature [K] and relative humidity (0-1)."""
-    return float(relative_humidity) * saturation_vapour_pressure(T_air)
+    e = float(relative_humidity) * saturation_vapour_pressure(T_air)
+    return float(e) if np.ndim(e) == 0 else e
 
 
 def thermalsky(T_air, emissivity_zenith=None, relative_humidity=0.5, band='8-14',

@@ -24,6 +24,7 @@ python 01_lwir_basic.py cuda_ad_spectral
 | `07_atmosphere.py` | Emissive air (`volpath_ir`): attenuation and path radiance versus range, gray or `--hitran` absorption |
 | `08_sky.py` | `thermalsky`: clear-sky radiance versus zenith angle; a polished metal plate mirroring the sky |
 | `09_hitran_transmittance.py` | Line-by-line H₂O/CO₂ transmittance from HITRAN (`hapi`); attenuated sun and air medium |
+| `10_thermal_solver.py` | Surface temperatures from the weather (`mitsuba.ir.thermal`): energy balance with shadows and sky-view factors from the scene, thermal lag, internal heat; LWIR renders through the day |
 
 Requirements: a spectral variant of Mitsuba (`scalar_spectral`, `llvm_ad_spectral`
 or `cuda_ad_spectral`), NumPy; matplotlib is used for the figures when available.
