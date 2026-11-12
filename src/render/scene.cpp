@@ -116,6 +116,21 @@ MI_VARIANT Scene<Float, Spectrum>::Scene(const Properties &props)
                   "emitters).", emitter->id());
     }
 
+    // Thermal emitters only carry the blackbody radiance of a surface. The
+    // emissivity (Kirchhoff's law) is applied by thermal-aware integrators.
+    if (m_integrator && !m_integrator->thermal_aware()) {
+        for (Emitter *emitter : m_emitters) {
+            if (has_flag(emitter->flags(), EmitterFlags::Thermal)) {
+                Log(Warn, "Scene: the scene contains thermal emitters, but the "
+                          "integrator does not implement Kirchhoff emission. "
+                          "Thermal surfaces will be rendered as blackbodies "
+                          "(emissivity 1). Use the 'path_ir' integrator for "
+                          "physically based infrared rendering.");
+                break;
+            }
+        }
+    }
+
     // Implement the deprecated "hide_emitters" flag by hiding every emitter
     // from camera rays before the acceleration data structures bake the
     // masks. The shape owns the property when the emitter has one.

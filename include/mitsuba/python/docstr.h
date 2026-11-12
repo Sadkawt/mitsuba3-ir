@@ -3849,6 +3849,11 @@ static const char *__doc_mitsuba_EmitterFlags_SpatiallyVarying = R"doc(The emiss
 
 static const char *__doc_mitsuba_EmitterFlags_Surface = R"doc(The emitter is attached to a surface (e.g. area emitters))doc";
 
+static const char *__doc_mitsuba_EmitterFlags_Thermal =
+R"doc(Thermal (Planckian) emitter: eval() returns the blackbody spectral radiance
+B(lambda, T) of the surface. The emissivity follows from Kirchhoff's law and
+is applied by thermal-aware integrators (e.g. ``path_ir``).)doc";
+
 static const char *__doc_mitsuba_EmitterFlags_SamplesTexture =
 R"doc(The emitter importance samples its texture and maps the result onto
 the shape through ``Shape::eval_parameterization()``, which meshes must

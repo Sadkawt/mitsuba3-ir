@@ -51,6 +51,16 @@ enum class EmitterFlags : uint32_t {
      */
     SamplesTexture       = 0x00080,
 
+    /**
+     * Thermal (Planckian) emitter: ``eval()`` returns the *blackbody* spectral
+     * radiance B(lambda, T) of the surface. The directional spectral emissivity
+     * is not applied by the emitter; it follows from Kirchhoff's law and is
+     * accounted for by thermal-aware integrators (e.g. ``path_ir``) through the
+     * difference formulation L = B + int f (L_in - B). Integrators that do
+     * not implement this treat the surface as a blackbody (emissivity 1).
+     */
+    Thermal              = 0x00100,
+
     // =============================================================
     //                  Compound lobe attributes
     // =============================================================

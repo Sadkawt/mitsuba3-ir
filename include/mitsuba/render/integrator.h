@@ -310,6 +310,17 @@ public:
     /// Whether the deprecated ``hide_emitters`` flag was set (see `Scene`)
     bool hide_emitters() const { return m_hide_emitters; }
 
+    /**
+     * \brief Does this integrator implement Kirchhoff emission for thermal
+     * emitters (``EmitterFlags::Thermal``)?
+     *
+     * Thermal emitters report the blackbody radiance of a surface; the
+     * emissivity is applied by the integrator. Integrators that return
+     * ``false`` here render thermal surfaces as blackbodies, and the
+     * \ref Scene constructor emits a warning in that case.
+     */
+    virtual bool thermal_aware() const { return false; }
+
     MI_DECLARE_PLUGIN_BASE_CLASS(Integrator)
 
 protected:

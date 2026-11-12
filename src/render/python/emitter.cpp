@@ -13,5 +13,6 @@ MI_PY_EXPORT(EmitterExtras) {
         .def_value(EmitterFlags, Invisible)
         .def_value(EmitterFlags, Portal)
         .def_value(EmitterFlags, SamplesTexture)
+        .def_value(EmitterFlags, Thermal)
         .def_value(EmitterFlags, Delta);
 }
