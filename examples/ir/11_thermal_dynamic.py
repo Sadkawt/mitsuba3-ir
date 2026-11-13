@@ -62,8 +62,10 @@ sim = th.ThermalScene({'type': 'scene', **geometry}, weather, materials,
 
 
 def camera(w, h, spp):
-    return {'type': 'perspective', 'fov': 28,
-            'to_world': T().look_at(origin=[3, 6, 9], target=[0, 0.3, -2.5], up=[0, 1, 0]),
+    # Close-up on the east side of the wall and the box: at 14:00 the sun is in
+    # the south-west, so both cast their shadows towards the north-east
+    return {'type': 'perspective', 'fov': 42,
+            'to_world': T().look_at(origin=[1.5, 5.0, 3.0], target=[-3.5, 0.0, -1.5], up=[0, 1, 0]),
             'sampler': {'type': 'independent', 'sample_count': spp},
             'film': ir.band_film(BAND, w, h)}
 
