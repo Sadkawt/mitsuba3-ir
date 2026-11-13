@@ -92,7 +92,13 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
     Point3f o = p + n * offset;
 
     // --- direct solar history: sum_k w_k cos(theta_k) V_k ---------------------
+    // The sun direction is jittered within each forcing step (one stratum
+    // sample per shading point, interpolating consecutive table entries), so
+    // that the visibility is integrated over the step instead of being
+    // sampled at its centre: this removes the time-step banding of moving
+    // shadow edges without bias.
     UInt32 n_steps = emitter->thermal_steps();
+    Float u_time = sampler->next_1d(active);
     struct Loop {
         UInt32 k;
         Float acc;
@@ -102,7 +108,12 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
     dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
         [n_steps](const Loop &l) { return l.k < n_steps; },
         [&](Loop &l) {
-            auto [s, w] = emitter->thermal_forcing(l.k, active);
+            auto [s0, w] = emitter->thermal_forcing(l.k, active);
+            UInt32 k1 = dr::minimum(l.k + 1, n_steps - 1);
+            auto [s1, w1] = emitter->thermal_forcing(k1, active);
+            // Interpolate towards the next entry only when it is a
+            // consecutive daylight step (non-zero weight)
+            Vector3f s = dr::select(w1 != ScalarFloat(0), dr::normalize(s0 + u_time * (s1 - s0)), s0);
             Float cos_i = dr::dot(n, s);
             Mask lit = active && (cos_i > ScalarFloat(1e-4)) && (w != ScalarFloat(0));
             Ray3f ray(o, s, time);

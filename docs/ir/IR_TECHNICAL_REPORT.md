@@ -871,7 +871,11 @@ shading points — the same scaling as next-event estimation — instead of to
 a texture resolution.
 
 *Bias.* Spatially none. Temporally the forcing discretisation Δt of the
-solver (10 min) is kept, with a deterministic quadrature over the day. The
+solver (10 min) is kept for the weights, while the sun *direction* is
+jittered within each step per shading sample (interpolating consecutive
+table entries), so the visibility is integrated over each step rather than
+sampled at its centre: moving shadow edges show no time-step banding, at
+the price of a little noise in the penumbra of the thermal shadow. The
 linearisation about the reference trajectory is the one approximation of
 the formulation; the correction c removes most of it: against the per-texel
 nonlinear solver, the roof-over-asphalt scene is reproduced to a mean of
