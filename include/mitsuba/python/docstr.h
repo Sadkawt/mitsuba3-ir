@@ -3854,6 +3854,10 @@ R"doc(Thermal (Planckian) emitter: eval() returns the blackbody spectral radianc
 B(lambda, T) of the surface. The emissivity follows from Kirchhoff's law and
 is applied by thermal-aware integrators (e.g. ``path_ir``).)doc";
 
+static const char *__doc_mitsuba_EmitterFlags_ThermalDynamic =
+R"doc(Thermal emitter whose surface temperature is evaluated at shading time by
+thermal-aware integrators from the forcing history and shadow rays.)doc";
+
 static const char *__doc_mitsuba_EmitterFlags_SamplesTexture =
 R"doc(The emitter importance samples its texture and maps the result onto
 the shape through ``Shape::eval_parameterization()``, which meshes must

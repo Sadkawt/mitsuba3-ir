@@ -61,6 +61,14 @@ enum class EmitterFlags : uint32_t {
      */
     Thermal              = 0x00100,
 
+    /**
+     * Thermal emitter whose surface temperature is evaluated at shading time
+     * by thermal-aware integrators from the solar/sky forcing history and
+     * shadow rays (linear-response model, see ``thermal_dynamic``). The
+     * emitter exposes the per-shape data through ``thermal_*()`` accessors.
+     */
+    ThermalDynamic       = 0x00200,
+
     // =============================================================
     //                  Compound lobe attributes
     // =============================================================
@@ -109,6 +117,35 @@ public:
 
     void parameters_changed(const std::vector<std::string> &keys = {}) override;
 
+    // =============================================================
+    //   Shading-time thermal model (EmitterFlags::ThermalDynamic)
+    // =============================================================
+
+    /**
+     * \brief Forcing table entry ``k``: unit vector towards the sun and the
+     * weight (K per unit cos(theta)) with which the direct solar irradiance of
+     * that time step contributes to the surface temperature at the render
+     * time. Zero for emitters that are not thermal-dynamic.
+     */
+    virtual std::pair<Vector3f, Float> thermal_forcing(UInt32 k, Mask active = true) const;
+
+    /// Number of forcing table entries (0 if not thermal-dynamic)
+    virtual uint32_t thermal_steps() const { return 0; }
+    /// Reference surface temperature at the render time [K]
+    virtual ScalarFloat thermal_t_ref() const { return 0.f; }
+    /// Broadband solar absorptance of the thermal model
+    virtual ScalarFloat thermal_alpha() const { return 0.f; }
+    /// Weighted reference direct-solar sum (K / alpha), subtracted from the shadow-ray sum
+    virtual ScalarFloat thermal_c_ref() const { return 0.f; }
+    /// Temperature change per unit decrease of the sky-view factor [K]
+    virtual ScalarFloat thermal_c_sky() const { return 0.f; }
+    /// Surface conductance h_conv + 4 eps sigma T_lin^3 used to linearise the response function [W m^-2 K^-1]
+    virtual ScalarFloat thermal_h_total() const { return 0.f; }
+    /// Convective heat transfer coefficient [W m^-2 K^-1]
+    virtual ScalarFloat thermal_h_conv() const { return 0.f; }
+    /// Broadband longwave emissivity of the thermal model
+    virtual ScalarFloat thermal_emissivity() const { return 0.f; }
+
     /// Return whether the emitter parameters have changed
     bool dirty() const { return m_dirty; }
 
@@ -156,6 +193,15 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Emitter)
     DRJIT_CALL_METHOD(pdf_position)
     DRJIT_CALL_METHOD(eval)
     DRJIT_CALL_METHOD(sample_wavelengths)
+    DRJIT_CALL_METHOD(thermal_forcing)
+    DRJIT_CALL_GETTER(thermal_steps)
+    DRJIT_CALL_GETTER(thermal_t_ref)
+    DRJIT_CALL_GETTER(thermal_alpha)
+    DRJIT_CALL_GETTER(thermal_c_ref)
+    DRJIT_CALL_GETTER(thermal_c_sky)
+    DRJIT_CALL_GETTER(thermal_h_total)
+    DRJIT_CALL_GETTER(thermal_h_conv)
+    DRJIT_CALL_GETTER(thermal_emissivity)
     DRJIT_CALL_GETTER(is_environment)
     DRJIT_CALL_GETTER(flags)
     DRJIT_CALL_GETTER(shape)

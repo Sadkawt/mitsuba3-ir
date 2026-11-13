@@ -1,8 +1,13 @@
 #pragma once
 
 #include <mitsuba/core/fwd.h>
+#include <mitsuba/core/frame.h>
+#include <mitsuba/core/ray.h>
+#include <mitsuba/core/warp.h>
+#include <mitsuba/render/fwd.h>
 #include <drjit/array.h>
 #include <drjit/math.h>
+#include <drjit/while_loop.h>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -47,6 +52,101 @@ Wavelength planck_radiance(const Wavelength &wavelengths, const Float &T) {
     B *= ScalarFloat(1e-9);
 
     return dr::select(T > ScalarFloat(0), B, Wavelength(ScalarFloat(0)));
+}
+
+/**
+ * \brief Surface temperature of a thermal-dynamic emitter at a surface point,
+ * evaluated at shading time (linear-response model; report section 6.8.3).
+ *
+ * T = T_ref + c( alpha * [sum_k w_k cos(theta_k) V_k - C_ref] + (F_sky - 1) C_sky )
+ *
+ * where V_k is the visibility of the sun at forcing step k (shadow ray),
+ * F_sky the cosine-weighted sky-view factor (``sky_rays`` rays) and c() the
+ * quasi-steady correction for the temperature dependence of the radiative
+ * conductance. All ray casting happens in the caller's kernel.
+ *
+ * \param scene    Scene used for the shadow and sky rays
+ * \param emitter  Per-lane emitter pointer (flags must contain ThermalDynamic)
+ * \param p, n     Surface point and outward geometric normal (world space)
+ * \param up       Zenith direction (world space)
+ * \param sampler  Sampler for the sky-view rays
+ * \param sky_rays Number of cosine-weighted hemisphere rays
+ * \param time     Ray time
+ */
+template <typename Float, typename Spectrum, typename Scene, typename EmitterPtr,
+          typename Sampler>
+Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
+                                  const Point<Float, 3> &p, const Normal<Float, 3> &n,
+                                  const Vector<dr::scalar_t<Float>, 3> &up, Sampler *sampler,
+                                  uint32_t sky_rays, const Float &time,
+                                  dr::mask_t<Float> active) {
+    using Mask     = dr::mask_t<Float>;
+    using UInt32   = dr::uint32_array_t<Float>;
+    using Vector3f = Vector<Float, 3>;
+    using Point3f  = Point<Float, 3>;
+    using Ray3f    = Ray<Point3f, Spectrum>;
+    using ScalarFloat = dr::scalar_t<Float>;
+
+    // Shadow rays leave the surface slightly along the normal
+    Float offset = dr::maximum(dr::max(dr::abs(p)) * ScalarFloat(1e-4), ScalarFloat(1e-4));
+    Point3f o = p + n * offset;
+
+    // --- direct solar history: sum_k w_k cos(theta_k) V_k ---------------------
+    UInt32 n_steps = emitter->thermal_steps();
+    struct Loop {
+        UInt32 k;
+        Float acc;
+        DRJIT_STRUCT(Loop, k, acc)
+    } ls = { UInt32(0), Float(0.f) };
+
+    dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
+        [n_steps](const Loop &l) { return l.k < n_steps; },
+        [&](Loop &l) {
+            auto [s, w] = emitter->thermal_forcing(l.k, active);
+            Float cos_i = dr::dot(n, s);
+            Mask lit = active && (cos_i > ScalarFloat(1e-4)) && (w != ScalarFloat(0));
+            Ray3f ray(o, s, time);
+            Mask occluded = scene->ray_test(ray, Mask(false), UInt32((uint32_t) RayMask::Secondary), lit);
+            dr::masked(l.acc, lit && !occluded) += w * cos_i;
+            l.k += 1;
+        });
+
+    // --- sky-view factor: cosine-weighted hemisphere rays ---------------------
+    Float F_sky = 1.f;
+    if (sky_rays > 0) {
+        Frame<Float> frame(n);
+        Float visible = 0.f;
+        for (uint32_t i = 0; i < sky_rays; ++i) {
+            Point<Float, 2> u = sampler->next_2d(active);
+            Vector3f d_local = warp::square_to_cosine_hemisphere(u);
+            Vector3f d = frame.to_world(d_local);
+            Mask above = dr::dot(d, Vector3f(up)) > ScalarFloat(0);
+            Mask occluded = scene->ray_test(Ray3f(o, d, time), Mask(false),
+                                            UInt32((uint32_t) RayMask::Secondary), active && above);
+            dr::masked(visible, above && !occluded) += ScalarFloat(1);
+        }
+        F_sky = visible / ScalarFloat(sky_rays);
+    }
+
+    // --- linear response and quasi-steady correction ---------------------------
+    Float alpha  = emitter->thermal_alpha(),
+          dT_lin = alpha * (ls.acc - emitter->thermal_c_ref())
+                   + (F_sky - ScalarFloat(1)) * emitter->thermal_c_sky();
+    Float h_lin  = emitter->thermal_h_total(),
+          h_conv = emitter->thermal_h_conv(),
+          eps    = emitter->thermal_emissivity(),
+          t_ref  = emitter->thermal_t_ref();
+    // Quasi-steady correction for the temperature dependence of the
+    // radiative conductance: the response function was linearised with the
+    // conductance h_lin; the actual conductance at this point and time is
+    // h_conv + 4 eps sigma T_mid^3 with T_mid halfway between the reference
+    // and the point temperature (report 6.8.3).
+    Float T_mid = t_ref + ScalarFloat(0.5) * dT_lin;
+    Float h_act = h_conv + ScalarFloat(4.0 * 5.670374419e-8) * eps * T_mid * T_mid * T_mid;
+    Float corr = dr::select(h_lin > ScalarFloat(0),
+                            h_lin / dr::maximum(h_act, ScalarFloat(0.25) * h_lin),
+                            Float(1.f));
+    return t_ref + dT_lin * corr;
 }
 
 NAMESPACE_END(mitsuba)

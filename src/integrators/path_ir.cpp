@@ -4,6 +4,7 @@
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/integrator.h>
 #include <mitsuba/render/records.h>
+#include <mitsuba/render/thermal.h>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -106,7 +107,10 @@ public:
                    m_clamp_direct, m_clamp_indirect, clamp_contribution)
     MI_IMPORT_TYPES(Scene, Sampler, Medium, Emitter, EmitterPtr, BSDF, BSDFPtr)
 
-    PathIRIntegrator(const Properties &props) : Base(props) { }
+    PathIRIntegrator(const Properties &props) : Base(props) {
+        m_thermal_up = dr::normalize(props.get<ScalarVector3f>("thermal_up", ScalarVector3f(0.f, 0.f, 1.f)));
+        m_sky_rays = props.get<uint32_t>("thermal_sky_rays", 8);
+    }
 
     bool thermal_aware() const override { return true; }
 
@@ -220,6 +224,18 @@ public:
                 L_e = emitter->eval(si);
                 is_thermal = has_flag(emitter->flags(), EmitterFlags::Thermal);
 
+                // Shading-time thermal model: evaluate the surface
+                // temperature from shadow and sky rays (report 6.8.3)
+                Mask is_dyn = has_flag(emitter->flags(), EmitterFlags::ThermalDynamic);
+                if (dr::any_or<true>(is_dyn)) {
+                    Float T = thermal_dynamic_temperature<Float, Spectrum>(
+                        scene, emitter, si.p, si.n, m_thermal_up, ls.sampler,
+                        m_sky_rays, si.time, is_dyn);
+                    if constexpr (is_spectral_v<Spectrum>)
+                        dr::masked(L_e, is_dyn) = depolarizer<Spectrum>(
+                            planck_radiance(si.wavelengths, T));
+                }
+
                 DirectionSample3f ds(scene, si, ls.vertex.si,
                                      ls.vertex.ray_mask);
                 Float em_pdf = 0.f;
@@ -274,6 +290,23 @@ public:
                     si, ls.sampler->next_2d(), true, active_em);
                 active_em &= (ds.pdf != 0.f);
                 wo = si.to_local(ds.d);
+
+                // Thermal-dynamic emitters: replace the reference radiance by
+                // the shading-time temperature at the sampled point
+                Mask dyn_em = active_em &&
+                              has_flag(ds.emitter->flags(), EmitterFlags::ThermalDynamic);
+                if (dr::any_or<true>(dyn_em)) {
+                    Float T = thermal_dynamic_temperature<Float, Spectrum>(
+                        scene, ds.emitter, ds.p, ds.n, m_thermal_up, ls.sampler,
+                        m_sky_rays, si.time, dyn_em);
+                    if constexpr (is_spectral_v<Spectrum>) {
+                        UnpolarizedSpectrum B     = planck_radiance(si.wavelengths, T),
+                                            B_ref = planck_radiance(si.wavelengths,
+                                                                    Float(ds.emitter->thermal_t_ref()));
+                        dr::masked(em_weight, dyn_em) *= depolarizer<Spectrum>(
+                            dr::select(B_ref > 0.f, B / B_ref, 0.f));
+                    }
+                }
             }
 
             // ------ Evaluate BSDF * cos(theta) and sample direction -------
@@ -396,6 +429,10 @@ public:
     }
 
     MI_DECLARE_CLASS(PathIRIntegrator)
+private:
+    /// Zenith direction and number of sky-view rays for thermal_dynamic emitters
+    ScalarVector3f m_thermal_up;
+    uint32_t m_sky_rays;
 };
 
 MI_EXPORT_PLUGIN(PathIRIntegrator)

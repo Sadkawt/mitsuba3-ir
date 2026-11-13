@@ -13,6 +13,11 @@ MI_VARIANT Emitter<Float, Spectrum>::Emitter(const Properties &props)
         props.get<std::string_view>("visibility", "all"));
 }
 
+MI_VARIANT std::pair<typename Emitter<Float, Spectrum>::Vector3f, Float>
+Emitter<Float, Spectrum>::thermal_forcing(UInt32 /*k*/, Mask /*active*/) const {
+    return { dr::zeros<Vector3f>(), 0.f };
+}
+
 MI_VARIANT void Emitter<Float, Spectrum>::traverse(TraversalCallback *cb) {
     cb->put("sampling_weight", m_sampling_weight, ParamFlags::NonDifferentiable);
 }

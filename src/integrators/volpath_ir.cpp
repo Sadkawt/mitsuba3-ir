@@ -93,7 +93,10 @@ public:
     MI_IMPORT_TYPES(Scene, Sampler, Emitter, EmitterPtr, BSDF, BSDFPtr,
                      Medium, MediumPtr, PhaseFunctionContext)
 
-    VolumetricPathIRIntegrator(const Properties &props) : Base(props) { }
+    VolumetricPathIRIntegrator(const Properties &props) : Base(props) {
+        m_thermal_up = dr::normalize(props.get<ScalarVector3f>("thermal_up", ScalarVector3f(0.f, 0.f, 1.f)));
+        m_sky_rays = props.get<uint32_t>("thermal_sky_rays", 8);
+    }
 
     bool thermal_aware() const override { return true; }
 
@@ -400,6 +403,17 @@ public:
                     }
                     Spectrum emitted = emitter->eval(si, active_e);
                     Mask is_thermal = active_e && has_flag(emitter->flags(), EmitterFlags::Thermal);
+
+                    // Shading-time thermal model (report 6.8.3)
+                    Mask is_dyn = active_e && has_flag(emitter->flags(), EmitterFlags::ThermalDynamic);
+                    if (dr::any_or<true>(is_dyn)) {
+                        Float T = thermal_dynamic_temperature<Float, Spectrum>(
+                            scene, emitter, si.p, si.n, m_thermal_up, sampler,
+                            m_sky_rays, si.time, is_dyn);
+                        if constexpr (is_spectral_v<Spectrum>)
+                            dr::masked(emitted, is_dyn) = depolarizer<Spectrum>(
+                                planck_radiance(si.wavelengths, T));
+                    }
                     dr::masked(B_cur, is_thermal) = emitted;
 
                     Spectrum contrib = dr::select(count_direct, throughput * emitted,
@@ -485,6 +499,21 @@ public:
         auto [ds, emitter_val] = scene->sample_emitter_direction(ref_interaction, sampler->next_2d(active), false, active);
         dr::masked(emitter_val, ds.pdf == 0.f) = 0.f;
         active &= (ds.pdf != 0.f);
+
+        // Thermal-dynamic emitters: shading-time temperature at the sampled point
+        Mask dyn_em = active && has_flag(ds.emitter->flags(), EmitterFlags::ThermalDynamic);
+        if (dr::any_or<true>(dyn_em)) {
+            Float T = thermal_dynamic_temperature<Float, Spectrum>(
+                scene, ds.emitter, ds.p, ds.n, m_thermal_up, sampler,
+                m_sky_rays, ref_interaction.time, dyn_em);
+            if constexpr (is_spectral_v<Spectrum>) {
+                UnpolarizedSpectrum B     = planck_radiance(ref_interaction.wavelengths, T),
+                                    B_ref = planck_radiance(ref_interaction.wavelengths,
+                                                            Float(ds.emitter->thermal_t_ref()));
+                dr::masked(emitter_val, dyn_em) *= depolarizer<Spectrum>(
+                    dr::select(B_ref > 0.f, B / B_ref, 0.f));
+            }
+        }
 
         if (dr::none_or<false>(active)) {
             return { emitter_val, ds };
@@ -656,6 +685,10 @@ public:
     };
 
     MI_DECLARE_CLASS(VolumetricPathIRIntegrator)
+private:
+    /// Zenith direction and number of sky-view rays for thermal_dynamic emitters
+    ScalarVector3f m_thermal_up;
+    uint32_t m_sky_rays;
 };
 
 MI_EXPORT_PLUGIN(VolumetricPathIRIntegrator)

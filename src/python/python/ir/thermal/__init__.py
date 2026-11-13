@@ -23,19 +23,23 @@ heat       ``Material`` properties with a table of common outdoor materials,
 scene      ``ThermalScene``: samples shapes of a Mitsuba scene, computes
            shadows and sky-view factors by ray casting, runs the solver and
            produces temperature textures / thermalised scene dictionaries.
+dynamic    ``DynamicModel``: linear-response tables for the ``thermal_dynamic``
+           emitter, whose temperature the IR integrators evaluate at every
+           shading point from shadow and sky rays (resolution-free shadows).
 
 See docs/ir/IR_TECHNICAL_REPORT.md, section 6.8.
 """
 
-from . import solar, weather, heat, scene
+from . import solar, weather, heat, scene, dynamic
 from .solar import solar_position, sun_direction, bird_clear_sky, cloud_correction, day_of_year
 from .weather import Weather, celsius
 from .heat import Material, MATERIALS, Column
 from .scene import ThermalScene, ThermalResult
+from .dynamic import DynamicModel
 
 __all__ = [
     'solar', 'weather', 'heat', 'scene',
     'solar_position', 'sun_direction', 'bird_clear_sky', 'cloud_correction', 'day_of_year',
     'Weather', 'celsius', 'Material', 'MATERIALS', 'Column',
-    'ThermalScene', 'ThermalResult',
+    'ThermalScene', 'ThermalResult', 'DynamicModel',
 ]

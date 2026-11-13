@@ -365,6 +365,56 @@ class ThermalScene:
             out[key] = vis
         return out
 
+    # --- shading-time (linear response) model -----------------------------------
+    def dynamic_models(self, dt=600.0, days_memory=6, ref_days=4):
+        """
+        :class:`DynamicModel` per simulated shape (cached). The reference
+        element of a shape has the shape's mean normal when it is well
+        defined (plates, roofs) and the zenith otherwise (closed objects).
+        """
+        from .dynamic import DynamicModel
+        key_dt = (float(dt), int(days_memory), int(ref_days))
+        cache = getattr(self, '_dyn_cache', {})
+        if cache.get('params') != key_dt:
+            cache = {'params': key_dt, 'models': {}}
+        models = {}
+        for key, sh in self.shapes.items():
+            n_ref = _mean_normal(sh)
+            n_ref = self.up if n_ref is None else n_ref
+            ck = (id(sh.material), tuple(np.round(n_ref, 3)))
+            if ck not in cache['models']:
+                cache['models'][ck] = DynamicModel(self.weather, sh.material, dt=dt, days_memory=days_memory,
+                                                   reference_normal=n_ref, up=self.up, north=self.north,
+                                                   ref_days=ref_days)
+            models[key] = cache['models'][ck]
+        self._dyn_cache = cache
+        return models
+
+    def dynamic(self, scene_dict, t_hours, twosided=True, default_temperature=None, dt=600.0,
+                days_memory=6):
+        """
+        Copy of ``scene_dict`` in which every simulated shape carries a
+        ``thermal_dynamic`` emitter for local time ``t_hours``: the surface
+        temperature is then evaluated by ``path_ir``/``volpath_ir`` at every
+        shading point from shadow and sky rays (no texture, no resolution
+        limit; report section 6.8.3). Set the integrator's ``thermal_up`` to
+        this scene's zenith direction.
+        """
+        if isinstance(t_hours, str):
+            h, m = t_hours.split(':')
+            t_hours = float(h) + float(m) / 60.0
+        models = self.dynamic_models(dt=dt, days_memory=days_memory)
+        out = _copy_tree(scene_dict)
+        for key, model in models.items():
+            node = out.get(key)
+            if node is None:
+                continue
+            node['emitter'] = model.emitter_dict(float(t_hours), twosided=twosided)
+        if default_temperature is not None:
+            from ..scene import thermalize
+            out = thermalize(out, temperature=float(default_temperature), twosided=twosided, in_place=True)
+        return out
+
     # --- simulation -----------------------------------------------------------
     def run(self, days=3, dt=300.0, output_times=(0, 3, 6, 9, 12, 15, 18, 21), T0=None,
             progress=False):
@@ -402,8 +452,11 @@ class ThermalScene:
             else:
                 vis_cache.append(None)
 
+        self._vis_cache = vis_cache
+        self._t_grid = t_grid
         records = {key: [] for key in self.shapes}
-        rec_steps = {int(np.argmin(np.abs(t_grid - t))): t for t in out_times}
+        from .dynamic import step_index
+        rec_steps = {step_index(t, dt, n_steps): t for t in out_times}
         for day in range(int(days)):
             for s in range(n_steps):
                 dni, dhi, ghi = float(irr['dni'][s]), float(irr['dhi'][s]), float(irr['ghi'][s])
@@ -427,6 +480,12 @@ class ThermalScene:
         times_sorted = [rec_steps[s] for s in sorted(rec_steps)]   # recorded in step order
         temps = {key: np.array(records[key]) for key in self.shapes}
         return ThermalResult(times_sorted, self.shapes, temps, w)
+
+
+def _mean_normal(sh):
+    n = sh.n[sh.idx].mean(axis=0)
+    norm = np.linalg.norm(n)
+    return n / norm if norm > 0.5 else None
 
 
 def _strip_sensors(scene_dict):

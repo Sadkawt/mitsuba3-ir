@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.4 — Phase 3b (scene temperatures from a surface energy balance) |
+| **Version** | 0.5 — Phase 3b (scene temperatures; shading-time evaluation with resolution-free thermal shadows) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -820,7 +820,7 @@ element, that reach the sky. Objects not simulated (no material given)
 still cast shadows. Cost: 33 000 elements × 3 days at 5-minute steps run
 in ≈ 5 s on 12 cores (`examples/ir/10_thermal_solver.py`).
 
-#### 6.8.2 Output
+#### 6.8.2 Output (texture mode)
 
 `ThermalResult.temperature(key, t)` returns the surface temperature field
 of a shape at an output time; `texture(key, t)` wraps a UV-sampled field as
@@ -835,6 +835,74 @@ wall shaded in the morning lagging the open ground by 16 K at 11:00 and
 still by 4 K at 14:00 after the shadow has moved (the thermal shadow), a 2
 mm steel box over a 60 °C compartment staying at 30–40 °C through the
 night, and a leaf canopy following the air temperature closely.
+
+#### 6.8.3 Shading-time evaluation: resolution-free thermal shadows
+
+The texture mode above resolves thermal shadows only to its texel size and
+its cost grows with texels × time steps regardless of what the camera sees.
+The default for rendering is therefore a second formulation that evaluates
+the surface temperature *at each shading point inside the integrator*.
+
+> **A21 — Linear response of the column.** With the radiative term
+> linearised, the column is a linear time-invariant system, so the surface
+> temperature of a point x at the render time t is
+> T(x, t) = T_ref(t) + c · Σ_k G_per(t − t_k) [q(x, t_k) − q_ref(t_k)] Δt,
+> where G is the surface-temperature response to a unit flux impulse (one
+> small 1-D solve per material with the column's own solver, held at its
+> mean reference temperature), periodised over the day because the forcing
+> is periodic, q_ref the forcing of a fully exposed reference element of the
+> same material and orientation whose temperature T_ref(t) is obtained with
+> the full nonlinear column, and c the quasi-steady correction
+> h_lin / (h_conv + 4εσ T_mid³) for the temperature dependence of the
+> radiative conductance (T_mid halfway between T_ref and the point).
+
+*Motivation.* This is the response-factor / conduction-transfer-function
+method of building thermal simulation [68, 69], applied per shading point.
+The only position-dependent terms of the forcing are the direct solar term
+α_s DNI_k cos θ_k V_k(x) and the sky-view terms (F_sky(x) − 1)(…), so the
+whole spatial dependence reduces to ray-casting queries at the exact hit
+point: Σ_k w_k cos θ_k V_k(x) with precomputed weights
+w_k = G_per(lag_k) DNI_k (one shadow ray per daylight step with
+cos θ_k > 0, ≈ 50–100 rays), and F_sky from a few cosine-weighted sky rays
+drawn from the integrator's sampler (an unbiased estimate; T is linear in
+F_sky). Thermal shadows thereby acquire the geometric sharpness of the ray
+tracer at any image resolution, with a cost proportional to the number of
+shading points — the same scaling as next-event estimation — instead of to
+a texture resolution.
+
+*Bias.* Spatially none. Temporally the forcing discretisation Δt of the
+solver (10 min) is kept, with a deterministic quadrature over the day. The
+linearisation about the reference trajectory is the one approximation of
+the formulation; the correction c removes most of it: against the per-texel
+nonlinear solver, the roof-over-asphalt scene is reproduced to a mean of
+< 0.3 K and a maximum of < 1 K at all times of day, including texels under
+the roof whose deviation from the exposed reference reaches −17 K
+(`test_ir_thermal_dynamic.py::test02`). Diagnosed and fixed on the way:
+the response function must be corrected with the radiative conductance *at
+the time of day* of the render (the reference element is 25 K warmer at
+14:00 than its daily mean), not merely with the deviation; and the two
+formulations must agree on the time-step convention (a 10-minute offset is
+0.6 K during the morning rise).
+
+*Implementation.* `thermal_dynamic` emitter (per-shape tables: T_ref,
+α_s, ε, h_conv, h_lin, C_ref, C_sky, weights w_k and sun directions, built
+by `ThermalScene.dynamic(scene_dict, t)` from `DynamicModel`), new
+`EmitterFlags::ThermalDynamic`, `Emitter::thermal_*()` accessors, and the
+evaluation routine `thermal_dynamic_temperature()` in
+`include/mitsuba/render/thermal.h`, called by `path_ir` and `volpath_ir`
+for BSDF-sampled hits *and* for next-event estimation (the emitter's own
+`eval()` returns the reference temperature, so no ray tracing happens
+inside emitter calls — which keeps the CUDA variant safe). Integrator
+parameters: `thermal_up` (zenith direction) and `thermal_sky_rays`
+(default 8). With all tables zero the emitter reproduces `thermal`
+bit-for-bit (`test03`); a 2 cm cover over asphalt renders a shadow edge of
+≤ 2 pixels at 25 cm and at 6 cm per pixel (`test04`), whereas a 20 m roof
+correctly produces a *soft* thermal shadow because its optical shadow
+sweeps ≈ 17 m across the day. Validity: the quasi-steady correction is
+exact in steady state and approximate during fast transients; large
+deviations (> 30 K, e.g. sunlit metal next to deep shade) should prefer a
+reference of the matching orientation (`ThermalScene` uses the shape's
+mean normal) or the texture mode for verification.
 
 ---
 
@@ -859,6 +927,7 @@ night, and a leaf canopy following the air temperature closely.
 | `thermal.Weather`, `thermal.solar_position`, `thermal.bird_clear_sky` | Parametrised weather and solar forcing (Section 6.8, A19) |
 | `thermal.Material`, `thermal.MATERIALS`, `thermal.Column` | Thermal material properties and the 1-D solver (A17, A18, A20) |
 | `thermal.ThermalScene`, `thermal.ThermalResult` | Scene sampling, shadows, sky view, time integration, temperature textures (Section 6.8.1–2) |
+| `thermal.ThermalScene.dynamic`, `thermal.DynamicModel` | Shading-time (linear-response) model: `thermal_dynamic` emitters evaluated by the integrators (Section 6.8.3) |
 | `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
 
 ### 7.2 Examples (`examples/ir/`)
@@ -875,6 +944,7 @@ night, and a leaf canopy following the air temperature closely.
 | `08_sky.py` | `thermalsky` angular radiance; polished Al plate mirroring the sky | Sky 245 K (zenith) → 293 K (horizon); 300 K Al plate reads 245–293 K depending on tilt |
 | `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km, 2.5–5.5 and 6.5–15.5 µm, with/without RSB continuum; attenuated sun and air medium | Window edges at 7.5–8 µm (H₂O) and 13.5–14 µm (CO₂), CO₂ 4.3 µm band opaque, continuum slope in the window |
 | `10_thermal_solver.py` | `mitsuba.ir.thermal`: asphalt, concrete wall, heated steel box, tree in Stockholm on 2026-07-15; probes through the day, LWIR renders at 08/14/20 h, diurnal curves | Moving optical shadows with lagging thermal shadows; asphalt 16–49 °C, wall 18–27 °C, box 30–40 °C |
+| `11_thermal_dynamic.py` | Same scene at 14:00 with `thermal_dynamic` emitters vs the 25 cm texture solver, close-up of the wall/tree shadows, timings | Resolution-free shadow edges; cost scales with shading points |
 
 ---
 
@@ -936,6 +1006,14 @@ Phase 3b adds `src/python_tests/test_ir_thermal.py` (7 tests):
 | `test05` | Periodic penetration into a semi-infinite solid at three depths | e^{−z/δ}, Carslaw & Jaeger |
 | `test06` | Roof over asphalt: F_sky under the roof < 0.3, thermal shadow > 10 K at noon, lag (15:00 warmer than 12:00, evening warmer than air), texture round trip and `path_ir` render | — |
 
+`src/python_tests/test_ir_thermal_dynamic.py` (5 tests, Section 6.8.3):
+impulse-response properties (positivity, decay, steady-state gain 1/h for a
+thin slab, periodisation); agreement with the per-texel solver (< 1 K max,
+< 0.3 K mean); bit-for-bit equivalence with `thermal` for zero tables in
+an isothermal cavity (BSDF hits and next-event estimation); shadow-edge
+width ≤ 2 px at two image resolutions and agreement of the unshaded
+temperature with T_ref; `path_ir` and `volpath_ir` agreement.
+
 **Convergence study** (isothermal cavity, L/B, 4 seeds): diffuse wall is
 exactly 1.0000 at any sample count (zero variance, as derived in Section
 3.2); rough Al (α = 0.3): 0.998 ± 0.011 at 256 spp, 1.003 ± 0.001 at 4096,
@@ -970,7 +1048,7 @@ given a correspondingly large `sampling_weight`; see Section 4.4.
 | 1 | Thermal emission of surfaces, Kirchhoff coupling, `path_ir`, validation | ✅ |
 | 2 | IR material data (Section 6), `mitsuba.ir` helpers, examples | ✅ |
 | 3 | Emissive media (`volpath_ir`, medium `temperature`), `thermalsky`, Idso clear-sky emissivity, HITRAN transmittance | ✅ |
-| 3b | Scene temperatures: `mitsuba.ir.thermal` energy-balance solver with scene shadows, parametrised weather, internal heat | ✅ |
+| 3b | Scene temperatures: `mitsuba.ir.thermal` energy-balance solver with scene shadows, parametrised weather, internal heat; shading-time evaluation (`thermal_dynamic`) | ✅ |
 | 4 | Sensor model: detector response curves [40], apparent-temperature output, NETD noise model | 📝 |
 | 5 | Polarized thermal emission; multiple-scattering microfacet BSDFs [22]; differentiable temperature | 📝 |
 
@@ -1127,6 +1205,10 @@ Known limitations of the present state:
 
 [66] W. J. Parton, J. A. Logan, "A model for diurnal variation in soil and air temperature," *Agricultural Meteorology* 23, 205–216, 1981.
 
+[68] D. G. Stephenson, G. P. Mitalas, "Cooling load calculations by thermal response factor method," *ASHRAE Transactions* 73(1), III.1.1–III.1.7, 1967.
+
+[69] G. P. Mitalas, D. G. Stephenson, "Room thermal response factors," *ASHRAE Transactions* 73(1), III.2.1–III.2.10, 1967.
+
 [67] T. M. Crawford, C. E. Duchon, "An improved parameterization for estimating effective atmospheric emissivity for use in calculating daytime downwelling longwave radiation," *Journal of Applied Meteorology* 38(4), 474–480, 1999.
 
 ---
@@ -1135,6 +1217,7 @@ Known limitations of the present state:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-13 | 0.5 | Shading-time thermal model: `thermal_dynamic` emitter, `EmitterFlags::ThermalDynamic`, `Emitter::thermal_*()` accessors, `thermal_dynamic_temperature()` in `path_ir`/`volpath_ir` (hits and NEE), `DynamicModel` / `ThermalScene.dynamic()`, 5 tests, example 11, assumption A21, references [68, 69]. |
 | 2026-11-12 | 0.4 | Phase 3b: `mitsuba.ir.thermal` (solar geometry, Bird clear sky, parametrised weather, 1-D energy-balance solver with scene shadows and sky-view factors, materials table, temperature textures), 7 tests, example 10, assumptions A17–A20, references [56]–[67]. |
 | 2026-11-12 | 0.3.1 | Atmosphere: RSB water-vapour continuum added to `hitran_absorption` (default on), grid step 0.05 cm⁻¹, example 09 extended beyond the band edges; A16 and §6.7 revised after review of the transmittance figure. |
 | 2026-11-12 | 0.3 | Phase 3: medium `temperature`, `volpath_ir` (difference formulation for emissive media), `thermalsky` emitter, `mitsuba.ir.atmosphere` (Idso emissivity, air media, HITRAN line-by-line via hapi), 14 new tests, examples 07–09, assumptions A14–A16, references [51]–[54]. |
