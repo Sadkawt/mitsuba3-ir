@@ -199,3 +199,36 @@ def test07_mesh_vertices_and_ply_export(variants_vec_backends_once_spectral, tmp
     T_app = ir.apparent_temperature(L, 9990.0, 10010.0)
     # top face: diffuse reflectance 0.5 -> emissivity 0.5 -> 0.5 B(T_top)
     assert abs(T_app - ir.apparent_temperature(0.5 * ir.band_radiance(9990.0, 10010.0, top), 9990.0, 10010.0)) < 1.0
+
+
+def test08_material_from_bsdf(variants_vec_backends_once_spectral):
+    import warnings
+    from mitsuba import ir
+    from mitsuba.ir import thermal as th
+    # Constant diffuse: alpha_s = eps = 1 - rho
+    a, e = ir.bsdf_thermal_properties({'type': 'diffuse', 'reflectance': 0.3}, n_samples=1024)
+    assert abs(a - 0.7) < 1e-3 and abs(e - 0.7) < 1e-3
+    # Two-band diffuse: bright in the solar, dark in the LWIR (concrete-like)
+    a, e = ir.bsdf_thermal_properties(ir.two_band_diffuse(0.35, 0.08), n_samples=1024)
+    assert abs(a - 0.65) < 0.02 and abs(e - 0.92) < 0.01
+    # Smooth aluminium: low solar absorptance, very low emissivity
+    a, e = ir.bsdf_thermal_properties(ir.conductor_ir('Al_ir'), n_samples=2048)
+    assert 0.05 < a < 0.15 and 0.01 < e < 0.04
+    # Fixed-incidence albedo at normal incidence equals 1 - F(0) for a smooth conductor
+    lam, n, k = ir.materials.load_ior('Al_ir')
+    rho_n = ir.albedo_spectrum(ir.conductor_ir('Al_ir'), [10000.0], n_samples=256, incidence=1.0)[0]
+    F0 = ir.materials.fresnel_conductor(1.0, np.interp(10000.0, lam, n), np.interp(10000.0, lam, k))
+    assert abs(rho_n - F0) < 1e-3
+    # ThermalScene adopts the BSDF-derived values and warns about the table values
+    w = th.Weather('2026-07-15', 59.33, 18.07, utc_offset=2)
+    scene = {'type': 'scene',
+             'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(5),
+                        'bsdf': {'type': 'diffuse', 'reflectance': 0.08}}}
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter('always')
+        ts = th.ThermalScene(scene, w, {'ground': th.MATERIALS['concrete']}, resolution=4, up=(0, 1, 0), north=(0, 0, -1), sky_rays=4)
+    assert abs(ts.shapes['ground'].material.alpha_solar - 0.92) < 0.01
+    assert any('solar absorptance' in str(r.message) for r in rec)
+    ts2 = th.ThermalScene(scene, w, {'ground': th.MATERIALS['concrete']}, resolution=4, up=(0, 1, 0), north=(0, 0, -1),
+                          sky_rays=4, material_from_bsdf=False)
+    assert ts2.shapes['ground'].material.alpha_solar == th.MATERIALS['concrete'].alpha_solar

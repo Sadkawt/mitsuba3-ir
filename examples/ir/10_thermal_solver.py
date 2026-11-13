@@ -44,18 +44,21 @@ print(weather.summary())
 # --- geometry (metres) -------------------------------------------------------
 T = mi.ScalarTransform4f
 geometry = {
+    # Reflectances are spectral: solar band / LWIR band (alpha_s = 1 - rho_solar,
+    # eps = 1 - rho_lwir); the thermal solver derives alpha_s and eps from these BSDFs
     'ground': {'type': 'rectangle', 'to_world': T().rotate([1, 0, 0], -90).scale(20),
-               'bsdf': {'type': 'diffuse', 'reflectance': 0.07}},                      # asphalt, eps 0.93
+               'bsdf': ir.two_band_diffuse(0.10, 0.07)},                               # asphalt
     'wall': {'type': 'cube', 'to_world': T().translate([-6, 1.5, 0]).scale([0.15, 1.5, 4.0]),
-             'bsdf': {'type': 'diffuse', 'reflectance': 0.08}},                        # concrete
+             'bsdf': ir.two_band_diffuse(0.35, 0.08)},                                 # concrete
     # painted steel: optically a rough dielectric paint layer (LWIR emissivity ~0.9),
     # thermally a 2 mm steel sheet (see 'materials' below)
     'box': {'type': 'cube', 'to_world': T().translate([3, 0.9, 2]).rotate([0, 1, 0], 20).scale([2.2, 0.9, 1.1]),
-            'bsdf': {'type': 'roughplastic', 'int_ior': 1.5, 'alpha': 0.3, 'diffuse_reflectance': 0.05}},
+            'bsdf': {'type': 'roughplastic', 'int_ior': 1.5, 'alpha': 0.3,
+                     'diffuse_reflectance': ir.two_band_diffuse(0.25, 0.04)['reflectance']}},  # dark paint
     'trunk': {'type': 'cylinder', 'p0': [6, 0, -5], 'p1': [6, 3.5, -5], 'radius': 0.25,
-              'bsdf': {'type': 'diffuse', 'reflectance': 0.1}},
+              'bsdf': ir.two_band_diffuse(0.40, 0.10)},                                # bark
     'canopy': {'type': 'sphere', 'center': [6, 5.0, -5], 'radius': 2.2,
-               'bsdf': {'type': 'diffuse', 'reflectance': 0.05}},
+               'bsdf': ir.two_band_diffuse(0.30, 0.03)},                               # leaves
 }
 
 materials = {

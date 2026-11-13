@@ -425,3 +425,100 @@ def window_ior(material, band, weight='planck', T=300.0):
     w = planck(grid, T) if weight == 'planck' else np.ones_like(grid)
     w = w / np.trapezoid(w, grid)
     return float(np.trapezoid(n_b * w, grid)), float(np.trapezoid(k_b * w, grid))
+
+
+# ---------------------------------------------------------------------------
+# Broadband thermal properties derived from a BSDF (report, A22)
+# ---------------------------------------------------------------------------
+
+def two_band_diffuse(rho_solar, rho_lwir, transition_nm=(2500.0, 3500.0)):
+    """
+    Lambertian BSDF dict with a reflectance that is ``rho_solar`` in the
+    solar spectrum and ``rho_lwir`` in the thermal infrared, with a linear
+    transition between ``transition_nm``. Most natural and painted surfaces
+    are much brighter in the solar than in the LWIR (concrete: 0.35 vs 0.08;
+    vegetation: 0.30 vs 0.03), which a single constant reflectance cannot
+    represent; this is the minimal spectrally consistent description for
+    the energy balance (alpha_s = 1 - rho_solar, eps = 1 - rho_lwir).
+    """
+    lo, hi = transition_nm
+    lam = [300.0, lo, hi, 20000.0]
+    val = [rho_solar, rho_solar, rho_lwir, rho_lwir]
+    return {'type': 'diffuse', 'reflectance': _irregular(lam, val)}
+
+
+def albedo_spectrum(bsdf, wavelengths_nm, n_samples=4096, incidence='hemispherical', seed=0):
+    """
+    Hemispherical albedo (directional-hemispherical reflectance + transmittance
+    integrated over incidence) of a BSDF at the given wavelengths, estimated
+    by Monte Carlo from the BSDF's own sampling routine: the sample weight
+    f cos / pdf is an unbiased estimate of the albedo for the sampled
+    incidence direction.
+
+    Parameters
+    ----------
+    bsdf : Mitsuba BSDF object or dictionary
+    wavelengths_nm : array of wavelengths [nm]
+    n_samples : directions per wavelength group
+    incidence : 'hemispherical' (cosine-weighted average over incidence, the
+        quantity that enters the diffuse-sky and longwave balance) or a float
+        cos(theta_i) for a fixed incidence angle
+    """
+    import mitsuba as mi
+    import drjit as dr
+    if isinstance(bsdf, dict):
+        bsdf = mi.load_dict(bsdf)
+    lam = np.asarray(wavelengths_nm, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    n = int(n_samples)
+    out = np.zeros(len(lam))
+    width = 4 if mi.variant().endswith('spectral') else 1
+    for i in range(0, len(lam), width):
+        group = lam[i:i + width]
+        lam4 = list(group) + [group[-1]] * (width - len(group))
+        si = dr.zeros(mi.SurfaceInteraction3f, n)
+        si.wavelengths = mi.Spectrum(*[mi.Float(np.full(n, float(l))) for l in lam4]) if width == 4 else si.wavelengths
+        if incidence == 'hemispherical':
+            u = rng.random((n, 2))
+            r = np.sqrt(u[:, 0])
+            phi = 2 * np.pi * u[:, 1]
+            wi = np.stack([r * np.cos(phi), r * np.sin(phi), np.sqrt(1 - u[:, 0])], 1)
+        else:
+            ct = float(incidence)
+            st = np.sqrt(max(1 - ct * ct, 0.0))
+            phi = 2 * np.pi * rng.random(n)
+            wi = np.stack([st * np.cos(phi), st * np.sin(phi), np.full(n, ct)], 1)
+        si.wi = mi.Vector3f(mi.Float(wi[:, 0]), mi.Float(wi[:, 1]), mi.Float(wi[:, 2]))
+        si.sh_frame = mi.Frame3f(mi.Vector3f(0, 0, 1))
+        si.n = mi.Normal3f(0, 0, 1)
+        s1 = mi.Float(rng.random(n))
+        s2 = mi.Point2f(mi.Float(rng.random(n)), mi.Float(rng.random(n)))
+        bs, w = bsdf.sample(mi.BSDFContext(), si, s1, s2)
+        W = np.array(w).reshape(width, -1)
+        out[i:i + len(group)] = W.mean(axis=1)[:len(group)]
+    return out
+
+
+def bsdf_thermal_properties(bsdf, T=300.0, n_samples=4096, solar_range=(300.0, 2500.0),
+                            thermal_range=(3000.0, 20000.0), seed=0):
+    """
+    Broadband solar absorptance and longwave emissivity implied by a BSDF
+    (Kirchhoff's law), for the thermal solver:
+
+        alpha_s = 1 - int rho(lam) E_sun(lam) dlam / int E_sun dlam    (300-2500 nm)
+        eps     = 1 - int rho(lam) B(lam, T) dlam / int B dlam         (3-20 um)
+
+    with rho the hemispherical albedo (:func:`albedo_spectrum`), E_sun the
+    top-of-atmosphere solar spectrum and B Planck's law at the surface
+    temperature ``T``. Returns (alpha_s, emissivity).
+    """
+    from .radiometry import planck, solar_irradiance_toa
+    lam_s = np.linspace(solar_range[0], solar_range[1], 45)
+    lam_t = np.linspace(thermal_range[0], thermal_range[1], 69)
+    rho_s = albedo_spectrum(bsdf, lam_s, n_samples=n_samples, seed=seed)
+    rho_t = albedo_spectrum(bsdf, lam_t, n_samples=n_samples, seed=seed + 1)
+    w_s = solar_irradiance_toa(lam_s)
+    w_t = planck(lam_t, T)
+    alpha = 1.0 - float(np.trapezoid(rho_s * w_s, lam_s) / np.trapezoid(w_s, lam_s))
+    eps = 1.0 - float(np.trapezoid(rho_t * w_t, lam_t) / np.trapezoid(w_t, lam_t))
+    return float(np.clip(alpha, 0.0, 1.0)), float(np.clip(eps, 0.0, 1.0))

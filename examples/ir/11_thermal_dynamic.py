@@ -36,16 +36,19 @@ weather = th.Weather('2026-07-15', latitude=59.33, longitude=18.07, utc_offset=2
                      T_min=th.celsius(14), T_max=th.celsius(26), relative_humidity=0.55,
                      wind_speed=2.0, cloud_cover=0.1, aod500=0.15, ground_albedo=0.15)
 geometry = {
+    # Reflectances are spectral: solar band / LWIR band (alpha_s = 1 - rho_solar,
+    # eps = 1 - rho_lwir); the thermal solver derives alpha_s and eps from these BSDFs
     'ground': {'type': 'rectangle', 'to_world': T().rotate([1, 0, 0], -90).scale(20),
-               'bsdf': {'type': 'diffuse', 'reflectance': 0.07}},
+               'bsdf': ir.two_band_diffuse(0.10, 0.07)},                               # asphalt
     'wall': {'type': 'cube', 'to_world': T().translate([-6, 1.5, 0]).scale([0.15, 1.5, 4.0]),
-             'bsdf': {'type': 'diffuse', 'reflectance': 0.08}},
+             'bsdf': ir.two_band_diffuse(0.35, 0.08)},                                 # concrete
     'box': {'type': 'cube', 'to_world': T().translate([3, 0.9, 2]).rotate([0, 1, 0], 20).scale([2.2, 0.9, 1.1]),
-            'bsdf': {'type': 'roughplastic', 'int_ior': 1.5, 'alpha': 0.3, 'diffuse_reflectance': 0.05}},
+            'bsdf': {'type': 'roughplastic', 'int_ior': 1.5, 'alpha': 0.3,
+                     'diffuse_reflectance': ir.two_band_diffuse(0.25, 0.04)['reflectance']}},  # dark paint
     'trunk': {'type': 'cylinder', 'p0': [6, 0, -5], 'p1': [6, 3.5, -5], 'radius': 0.25,
-              'bsdf': {'type': 'diffuse', 'reflectance': 0.1}},
+              'bsdf': ir.two_band_diffuse(0.40, 0.10)},                                # bark
     'canopy': {'type': 'sphere', 'center': [6, 5.0, -5], 'radius': 2.2,
-               'bsdf': {'type': 'diffuse', 'reflectance': 0.05}},
+               'bsdf': ir.two_band_diffuse(0.30, 0.03)},                               # leaves
 }
 materials = {
     'ground': th.MATERIALS['asphalt'],
@@ -64,7 +67,12 @@ sim = th.ThermalScene({'type': 'scene', **geometry}, weather, materials,
 def camera(w, h, spp):
     # Close-up on the east side of the wall and the box: at 14:00 the sun is in
     # the south-west, so both cast their shadows towards the north-east
-    return {'type': 'perspective', 'fov': 42,
+
+    return {'type': 'perspective', 'fov': 55,
+                       'to_world': T().look_at(origin=[4, 9, 16], target=[0, 0.5, -1], up=[0, 1, 0]),
+                       'sampler': {'type': 'independent', 'sample_count': 64},
+                       'film': ir.band_film(BAND, 640, 400)}
+    return {'type': 'perspective', 'fov': 120,
             'to_world': T().look_at(origin=[1.5, 5.0, 3.0], target=[-3.5, 0.0, -1.5], up=[0, 1, 0]),
             'sampler': {'type': 'independent', 'sample_count': spp},
             'film': ir.band_film(BAND, w, h)}

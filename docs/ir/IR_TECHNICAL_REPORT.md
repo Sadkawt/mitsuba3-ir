@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.5 — Phase 3b (scene temperatures; shading-time evaluation with resolution-free thermal shadows) |
+| **Version** | 0.6 — Phase 3b (scene temperatures; shading-time evaluation; thermal properties derived from the BSDF) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -908,6 +908,44 @@ deviations (> 30 K, e.g. sunlit metal next to deep shade) should prefer a
 reference of the matching orientation (`ThermalScene` uses the shape's
 mean normal) or the texture mode for verification.
 
+#### 6.8.4 Broadband thermal properties from the BSDF
+
+> **A22 — α_s and ε of the energy balance are derived from the BSDF.**
+> The hemispherical albedo spectrum ρ(λ) of a shape's BSDF is estimated by
+> Monte Carlo from the BSDF's own sampling routine (E[f cos θ / p] = ρ_dh,
+> averaged over cosine-weighted incidence), and
+> α_s = 1 − ∫ρ E_sun dλ / ∫E_sun dλ over 0.3–2.5 µm,
+> ε = 1 − ∫ρ B(λ, T) dλ / ∫B dλ over 3–20 µm (T: the material's
+> interior temperature if any, else 300 K). `ThermalScene` uses these by
+> default (`material_from_bsdf=True`) and warns when a `Material`'s own
+> values disagree by more than 0.05.
+
+*Motivation.* A3 makes the rendered emissivity a consequence of the BSDF;
+if the heat balance used independent broadband numbers, a scene could be
+heated with one material and rendered with another without anyone
+noticing — example 10 originally did exactly that (a `diffuse 0.08`
+"concrete" wall implies α_s = 0.92 where concrete has ≈ 0.65, a 150 W m⁻²
+error at noon). Deriving both from the BSDF closes the loop: one material
+description drives heat transfer and radiance. Two consequences follow.
+First, realistic outdoor materials need *spectrally varying* reflectance
+(bright in the solar, dark in the LWIR: concrete 0.35/0.08, leaves 0.30/
+0.03); `mitsuba.ir.two_band_diffuse` provides the minimal consistent
+description, and the examples now use it. Second, the energy loss of
+single-scattering microfacet models (A5) becomes a *thermal* input: rough
+aluminium (α = 0.3) shows ρ ≈ 0.83 in the LWIR, i.e. ε ≈ 0.17 where a real
+brushed surface has 0.05–0.10 — the known limitation of these BSDFs,
+visible here as a few kelvin of over-cooling at night, until multiple-
+scattering microfacet models are added. The hemispherical (rather than
+direct-sun, angle-dependent) absorptance is used for the direct term as
+well; for metals and glazing at grazing incidence this underestimates the
+reflected fraction — a refinement that fits the shading-time formulation
+(cos θ_k-dependent α_s) and is noted for later.
+
+Validation (`test_ir_thermal.py::test08`): constant diffuse 0.3 →
+α_s = ε = 0.700; two-band 0.35/0.08 → 0.65/0.92; smooth `Al_ir` → α_s ≈ 0.09,
+ε ≈ 0.02; fixed-incidence albedo of a smooth conductor equals 1 − F(0) to
+10⁻³; `ThermalScene` adopts the derived values and warns.
+
 ---
 
 ## 7. Helper library and examples
@@ -932,6 +970,7 @@ mean normal) or the texture mode for verification.
 | `thermal.Material`, `thermal.MATERIALS`, `thermal.Column` | Thermal material properties and the 1-D solver (A17, A18, A20) |
 | `thermal.ThermalScene`, `thermal.ThermalResult` | Scene sampling, shadows, sky view, time integration, temperature textures (Section 6.8.1–2) |
 | `thermal.ThermalScene.dynamic`, `thermal.DynamicModel` | Shading-time (linear-response) model: `thermal_dynamic` emitters evaluated by the integrators (Section 6.8.3) |
+| `two_band_diffuse`, `albedo_spectrum`, `bsdf_thermal_properties` | Spectrally consistent diffuse materials; α_s and ε from a BSDF (Section 6.8.4) |
 | `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
 
 ### 7.2 Examples (`examples/ir/`)
@@ -1071,7 +1110,7 @@ Known limitations of the present state:
 * Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
 * Thermal solver: no lateral conduction, no evapotranspiration or
   precipitation, surroundings linearised to T_air, periodic single-day
-  forcing, broadband α_s/ε separate from the rendering BSDF (A17–A20).
+  forcing; α_s is hemispherical rather than incidence-dependent (A17–A22).
 
 ---
 
@@ -1221,6 +1260,7 @@ Known limitations of the present state:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-13 | 0.6 | α_s and ε of the thermal solver derived from the BSDF (`bsdf_thermal_properties`, `albedo_spectrum`, `two_band_diffuse`; `ThermalScene(material_from_bsdf=True)` default with disagreement warning); examples 10/11 use spectrally consistent materials; assumption A22. |
 | 2026-11-13 | 0.5 | Shading-time thermal model: `thermal_dynamic` emitter, `EmitterFlags::ThermalDynamic`, `Emitter::thermal_*()` accessors, `thermal_dynamic_temperature()` in `path_ir`/`volpath_ir` (hits and NEE), `DynamicModel` / `ThermalScene.dynamic()`, 5 tests, example 11, assumption A21, references [68, 69]. |
 | 2026-11-12 | 0.4 | Phase 3b: `mitsuba.ir.thermal` (solar geometry, Bird clear sky, parametrised weather, 1-D energy-balance solver with scene shadows and sky-view factors, materials table, temperature textures), 7 tests, example 10, assumptions A17–A20, references [56]–[67]. |
 | 2026-11-12 | 0.3.1 | Atmosphere: RSB water-vapour continuum added to `hitran_absorption` (default on), grid step 0.05 cm⁻¹, example 09 extended beyond the band edges; A16 and §6.7 revised after review of the transmittance figure. |

@@ -28,7 +28,7 @@ from .materials import (
     drude_lorentz_nk, RAKIC_LD, conductor_ir, opaque_ir, window_ior,
     normal_emissivity, hemispherical_emissivity, load_spd,
     load_ecostress, diffuse_from_emissivity, diffuse_from_reflectance,
-    IR_MATERIALS,
+    IR_MATERIALS, two_band_diffuse, albedo_spectrum, bsdf_thermal_properties,
 )
 from .scene import thermalize, validate, sun, sky_blackbody
 from .atmosphere import (
@@ -43,7 +43,7 @@ __all__ = [
     'drude_lorentz_nk', 'RAKIC_LD', 'conductor_ir', 'opaque_ir', 'window_ior',
     'normal_emissivity', 'hemispherical_emissivity', 'load_spd',
     'load_ecostress', 'diffuse_from_emissivity', 'diffuse_from_reflectance',
-    'IR_MATERIALS',
+    'IR_MATERIALS', 'two_band_diffuse', 'albedo_spectrum', 'bsdf_thermal_properties',
     'thermalize', 'validate', 'sun', 'sky_blackbody',
     'sky_emissivity_idso', 'thermalsky', 'air_medium', 'medium_box', 'hitran_absorption',
     'transmittance', 'vapour_pressure', 'rsb_continuum',

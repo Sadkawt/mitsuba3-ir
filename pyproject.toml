@@ -124,3 +124,8 @@ text = '''
 path = "README.md"
 start-after = "Mitsuba banner\">\n"
 pattern = "(.*)"
+
+[tool.uv.workspace]
+members = [
+    "examples/ir/env",
+]

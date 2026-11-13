@@ -278,6 +278,12 @@ class ThermalScene:
     mesh_mode : 'auto' (default), 'uv' or 'vertex'
         How meshes are sampled: 'auto' uses a UV grid when the mesh has a
         unique UV unwrap (rasterised overlap test) and vertices otherwise.
+    material_from_bsdf : bool
+        Derive the broadband solar absorptance and longwave emissivity of each
+        simulated shape from its BSDF (Kirchhoff's law; report A22) instead of
+        using the values of the ``Material``; a warning is printed when the
+        two disagree by more than ``tolerance``. This keeps the energy balance
+        consistent with the rendered emissivity. Shapes need an explicit BSDF.
     up, north : world-space zenith and geographic north directions.
     sky_rays : hemisphere rays per element for the sky-view factor.
     T_surroundings : temperature of the unresolved surroundings seen by an
@@ -285,7 +291,8 @@ class ThermalScene:
     """
 
     def __init__(self, scene_dict, weather, materials, resolution=64, up=(0, 0, 1),
-                 north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto'):
+                 north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto',
+                 material_from_bsdf=True, tolerance=0.05):
         import mitsuba as mi
         self.weather = weather
         self.up = np.asarray(up, dtype=np.float64) / np.linalg.norm(up)
@@ -299,11 +306,31 @@ class ThermalScene:
             if key not in ids:
                 raise KeyError(f"shape '{key}' not found in the scene (ids: {sorted(ids)})")
             res = resolution.get(key, 64) if isinstance(resolution, dict) else resolution
+            if material_from_bsdf:
+                mat = self._material_from_bsdf(key, ids[key], mat, tolerance)
             self.shapes[key] = _ShapeElements(key, ids[key], mat, res, mesh_mode=mesh_mode)
         bbox = self.scene.bbox()
         self.eps = 1e-4 * float(np.linalg.norm(np.array(bbox.max) - np.array(bbox.min)))
         self._rng = np.random.default_rng(seed)
         self._compute_sky_view(sky_rays)
+
+    @staticmethod
+    def _material_from_bsdf(key, shape, material, tolerance):
+        from ..materials import bsdf_thermal_properties
+        bsdf = shape.bsdf()
+        T_lin = material.T_internal if (material.back == 'interior' and material.T_internal) else 300.0
+        alpha, eps = bsdf_thermal_properties(bsdf, T=float(T_lin))
+        msgs = []
+        if abs(alpha - material.alpha_solar) > tolerance:
+            msgs.append(f"solar absorptance {material.alpha_solar:.2f} (material) vs {alpha:.2f} (BSDF)")
+        if abs(eps - material.emissivity) > tolerance:
+            msgs.append(f"emissivity {material.emissivity:.2f} (material) vs {eps:.2f} (BSDF)")
+        if msgs:
+            import warnings
+            warnings.warn(f"ThermalScene: shape '{key}': " + '; '.join(msgs) +
+                          ". Using the BSDF-derived values (pass material_from_bsdf=False to keep the material's).",
+                          stacklevel=3)
+        return material.replace(alpha_solar=alpha, emissivity=eps)
 
     # --- ray casting helpers ------------------------------------------------
     def _ray_test(self, o, d):
