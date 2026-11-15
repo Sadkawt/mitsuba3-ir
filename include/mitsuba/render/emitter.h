@@ -145,6 +145,22 @@ public:
     virtual ScalarFloat thermal_h_conv() const { return 0.f; }
     /// Broadband longwave emissivity of the thermal model
     virtual ScalarFloat thermal_emissivity() const { return 0.f; }
+    /// Index of this emitter's thermal material (receiver index into the exchange fields)
+    virtual uint32_t thermal_material_index() const { return 0; }
+    /// Baseline of the longwave exchange field for this receiver: sum_k G_k sigma T_air,k^4 [K]
+    virtual ScalarFloat thermal_h_air() const { return 0.f; }
+    /// Baseline of the shortwave exchange field for this receiver: sum_k G_k rho_g GHI_k [K]
+    virtual ScalarFloat thermal_s_ref() const { return 0.f; }
+
+    /**
+     * \brief Radiative-exchange fields of this (hit) surface at ``si`` for a
+     * receiver of thermal material ``m``, as deviations from the receiver's
+     * baselines: (H_lw(si, m) - h_air, H_sw(si, m) - s_ref) in kelvin per
+     * unit view factor (before the receiver's emissivity / absorptance).
+     * Zero for emitters without exchange fields.
+     */
+    virtual std::pair<Float, Float> thermal_exchange(const SurfaceInteraction3f &si, UInt32 m,
+                                                     Float h_air, Float s_ref, Mask active = true) const;
 
     /// Return whether the emitter parameters have changed
     bool dirty() const { return m_dirty; }
@@ -202,6 +218,10 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Emitter)
     DRJIT_CALL_GETTER(thermal_h_total)
     DRJIT_CALL_GETTER(thermal_h_conv)
     DRJIT_CALL_GETTER(thermal_emissivity)
+    DRJIT_CALL_GETTER(thermal_material_index)
+    DRJIT_CALL_GETTER(thermal_h_air)
+    DRJIT_CALL_GETTER(thermal_s_ref)
+    DRJIT_CALL_METHOD(thermal_exchange)
     DRJIT_CALL_GETTER(is_environment)
     DRJIT_CALL_GETTER(flags)
     DRJIT_CALL_GETTER(shape)

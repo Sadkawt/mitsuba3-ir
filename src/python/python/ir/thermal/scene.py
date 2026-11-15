@@ -278,6 +278,13 @@ class ThermalScene:
     mesh_mode : 'auto' (default), 'uv' or 'vertex'
         How meshes are sampled: 'auto' uses a UV grid when the mesh has a
         unique UV unwrap (rasterised overlap test) and vertices otherwise.
+    exchange : bool
+        Radiative exchange between the simulated surfaces (report A23):
+        directions that hit another simulated element receive its longwave
+        radiosity (emission + one-bounce reflection) and its reflected solar
+        irradiance instead of the generic surroundings at ``T_surroundings``
+        with albedo ``ground_albedo``. Directions hitting non-simulated
+        geometry keep the generic surroundings.
     material_from_bsdf : bool
         Derive the broadband solar absorptance and longwave emissivity of each
         simulated shape from its BSDF (Kirchhoff's law; report A22) instead of
@@ -292,14 +299,16 @@ class ThermalScene:
 
     def __init__(self, scene_dict, weather, materials, resolution=64, up=(0, 0, 1),
                  north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto',
-                 material_from_bsdf=True, tolerance=0.05):
+                 material_from_bsdf=True, tolerance=0.05, exchange=True):
         import mitsuba as mi
         self.weather = weather
         self.up = np.asarray(up, dtype=np.float64) / np.linalg.norm(up)
         self.north = np.asarray(north, dtype=np.float64)
         self.T_surroundings = T_surroundings
         self.scene_dict = scene_dict
-        self.scene = mi.load_dict(_strip_sensors(scene_dict))
+        # optimize=False: keep every dictionary entry as its own shape (the parser
+        # otherwise merges meshes that share an identical BSDF)
+        self.scene = mi.load_dict(_strip_sensors(scene_dict), optimize=False)
         ids = {s.id(): s for s in self.scene.shapes()}
         self.shapes = {}
         for key, mat in materials.items():
@@ -312,7 +321,16 @@ class ThermalScene:
         bbox = self.scene.bbox()
         self.eps = 1e-4 * float(np.linalg.norm(np.array(bbox.max) - np.array(bbox.min)))
         self._rng = np.random.default_rng(seed)
-        self._compute_sky_view(sky_rays)
+        self.exchange = bool(exchange)
+        # Global element indexing (concatenation of the shapes in order)
+        self._keys = list(self.shapes)
+        self._offsets = {}
+        off = 0
+        for key in self._keys:
+            self._offsets[key] = off
+            off += self.shapes[key].E
+        self.n_elements = off
+        self._compute_view_factors(sky_rays)
 
     @staticmethod
     def _material_from_bsdf(key, shape, material, tolerance):
@@ -344,11 +362,48 @@ class ThermalScene:
             hit = np.full(o.shape[0], bool(hit[0]))
         return hit.astype(bool)
 
-    def _compute_sky_view(self, n_rays):
-        """Fraction of the hemisphere above each element from which the sky is visible
-        (cosine-weighted, i.e. the configuration factor to the sky). Uses a
-        stratified (Hammersley) direction set rotated randomly per element."""
-        # Cosine-weighted Hammersley directions in the local frame
+    def _hit_elements(self, si):
+        """Global element index of the element hit by each ray (-1 when the hit is
+        not on a simulated shape); requires a valid SurfaceInteraction array."""
+        import mitsuba as mi
+        import drjit as dr
+        n = len(_as_numpy(si.t).ravel())
+        gidx = np.full(n, -1, dtype=np.int64)
+        valid = _as_numpy(si.is_valid()).ravel()
+        uv = _as_numpy(si.uv).reshape(2, -1).T
+        p = _as_numpy(si.p).reshape(3, -1).T
+        prim = _as_numpy(si.prim_index).ravel()
+        for key in self._keys:
+            sh = self.shapes[key]
+            m = _as_numpy(si.shape == sh.shape).ravel() & valid
+            if not m.any():
+                continue
+            if sh.mode == 'uv':
+                H, W = sh.res
+                col = np.clip((uv[m, 0] * W).astype(int), 0, W - 1)
+                row = np.clip((uv[m, 1] * H).astype(int), 0, H - 1)
+                flat = row * W + col
+                inv = np.full(H * W, -1)
+                inv[sh.idx] = np.arange(sh.E)
+                local = inv[flat].astype(np.int64)
+            else:
+                fi = _as_numpy(sh.shape.face_indices(mi.UInt32(prim[m].astype(np.uint32)))).reshape(3, -1).T.astype(np.int64)
+                d = np.stack([np.linalg.norm(sh.p[fi[:, j]] - p[m], axis=1) for j in range(3)], 1)
+                local = fi[np.arange(len(fi)), np.argmin(d, axis=1)]
+            g = np.where(local >= 0, local + self._offsets[key], -1)
+            gidx[m] = g
+        return gidx
+
+    def _compute_view_factors(self, n_rays):
+        """
+        Cosine-weighted hemisphere sampling from every element (stratified
+        Hammersley directions, randomly rotated per element) classifying each
+        direction as: sky (unoccluded and above the horizon), another
+        simulated element (recorded as a sparse view-factor entry), or other
+        (non-simulated geometry / below the horizon). Fills ``F_sky`` and
+        ``f_other`` per shape and the global sparse matrix (rows, cols, w).
+        """
+        import mitsuba as mi
         k = np.arange(n_rays)
         u1 = (k + 0.5) / n_rays
         bits = k.astype(np.uint32)
@@ -359,23 +414,66 @@ class ThermalScene:
             bits >>= 1
             f *= 0.5
         r = np.sqrt(u1)
-        for sh in self.shapes.values():
+        rows, cols = [], []
+        for key in self._keys:
+            sh = self.shapes[key]
             p = sh.p[sh.idx]
             n = sh.n[sh.idx]
             E = len(p)
             F = np.zeros(E)
+            other = np.zeros(E)
             t = np.cross(n, np.where(np.abs(n[:, [0]]) < 0.9, [[1.0, 0, 0]], [[0, 1.0, 0]]))
             t /= np.linalg.norm(t, axis=1, keepdims=True)
             b = np.cross(n, t)
-            rot = self._rng.random(E) * 2 * np.pi           # decorrelating rotation about the normal
+            rot = self._rng.random(E) * 2 * np.pi
+            o = p + n * self.eps
+            base = self._offsets[key]
             for j in range(n_rays):
                 phi = 2 * np.pi * u2[j] + rot
                 d = (r[j] * np.cos(phi))[:, None] * t + (r[j] * np.sin(phi))[:, None] * b \
                     + np.sqrt(1 - u1[j]) * n
                 above = (d @ self.up) > 0.0
-                hit = self._ray_test(p + n * self.eps, d)
+                ray = mi.Ray3f(mi.Point3f(mi.Float(o[:, 0]), mi.Float(o[:, 1]), mi.Float(o[:, 2])),
+                               mi.Vector3f(mi.Float(d[:, 0]), mi.Float(d[:, 1]), mi.Float(d[:, 2])))
+                si = self.scene.ray_intersect(ray)
+                hit = _as_numpy(si.is_valid()).ravel()
+                if hit.size == 1 and E > 1:
+                    hit = np.full(E, bool(hit[0]))
                 F += (~hit) & above
+                if hit.any():
+                    g = self._hit_elements(si)
+                    sim = hit & (g >= 0)
+                    other += hit & ~sim
+                    rows.append(base + np.where(sim)[0])
+                    cols.append(g[sim])
+                other += (~hit) & ~above
             sh.F_sky = F / n_rays
+            sh.f_other = other / n_rays
+        if rows:
+            rows = np.concatenate(rows)
+            cols = np.concatenate(cols)
+            key = rows * self.n_elements + cols
+            uniq, counts = np.unique(key, return_counts=True)
+            self._vf_rows = (uniq // self.n_elements).astype(np.int64)
+            self._vf_cols = (uniq % self.n_elements).astype(np.int64)
+            self._vf_w = counts / n_rays
+        else:
+            self._vf_rows = np.zeros(0, dtype=np.int64)
+            self._vf_cols = np.zeros(0, dtype=np.int64)
+            self._vf_w = np.zeros(0)
+        f_sim = np.bincount(self._vf_rows, weights=self._vf_w, minlength=self.n_elements)
+        self.f_sim = f_sim
+        # Without exchange, simulated-geometry hits count as generic surroundings
+        for key in self._keys:
+            sh = self.shapes[key]
+            sl = slice(self._offsets[key], self._offsets[key] + sh.E)
+            sh.f_sim = f_sim[sl]
+
+    def exchange_apply(self, x):
+        """Sparse view-factor product (sum_j M_ij x_j) over all elements."""
+        if self._vf_rows.size == 0:
+            return np.zeros(self.n_elements)
+        return np.bincount(self._vf_rows, weights=self._vf_w * x[self._vf_cols], minlength=self.n_elements)
 
     def _solar_visibility(self, sun_dir):
         """cos(theta_i) * visibility for every element (0 when shadowed or facing away)."""
@@ -418,7 +516,7 @@ class ThermalScene:
         return models
 
     def dynamic(self, scene_dict, t_hours, twosided=True, default_temperature=None, dt=600.0,
-                days_memory=6):
+                days_memory=6, exchange=None, mesh_dir=None, days=3):
         """
         Copy of ``scene_dict`` in which every simulated shape carries a
         ``thermal_dynamic`` emitter for local time ``t_hours``: the surface
@@ -426,17 +524,78 @@ class ThermalScene:
         shading point from shadow and sky rays (no texture, no resolution
         limit; report section 6.8.3). Set the integrator's ``thermal_up`` to
         this scene's zenith direction.
+
+        With ``exchange`` (default: the scene's setting) the radiative
+        exchange between simulated surfaces is included through smooth
+        per-shape exchange fields (one per receiver material), obtained by
+        convolving the radiosity histories of the per-element solver with
+        the receivers' response functions (report 6.8.5). The per-element
+        solver is run (``days`` spin-up days, step ``dt``) when needed.
+        Vertex-sampled meshes are written to ``mesh_dir`` as PLY with the
+        fields as vertex attributes.
         """
+        import os
+        import tempfile
+        import mitsuba as mi
         if isinstance(t_hours, str):
             h, m = t_hours.split(':')
             t_hours = float(h) + float(m) / 60.0
+        t_hours = float(t_hours)
+        exchange = self.exchange if exchange is None else bool(exchange)
         models = self.dynamic_models(dt=dt, days_memory=days_memory)
+        # Receiver material indices: distinct DynamicModel objects
+        model_list = []
+        for mdl in models.values():
+            if all(mdl is not x for x in model_list):
+                model_list.append(mdl)
+        m_index = {key: next(i for i, x in enumerate(model_list) if x is models[key]) for key in models}
+        if exchange:
+            if not hasattr(self, '_J_hist') or self._hist_dt != dt or not self.exchange:
+                self.exchange = True
+                self.run(days=days, dt=dt, output_times=[t_hours])
+                self._hist_dt = dt
         out = _copy_tree(scene_dict)
         for key, model in models.items():
             node = out.get(key)
             if node is None:
                 continue
-            node['emitter'] = model.emitter_dict(float(t_hours), twosided=twosided)
+            sh = self.shapes[key]
+            em = model.emitter_dict(t_hours, twosided=twosided)
+            em['material_index'] = int(m_index[key])
+            h_air, s_ref = model.baselines(t_hours)
+            em['h_air'] = h_air
+            em['s_ref'] = s_ref
+            if exchange:
+                sl = slice(self._offsets[key], self._offsets[key] + sh.E)
+                fields = {}
+                for mi_idx, recv in enumerate(model_list):
+                    fields[f'exchange_lw_{mi_idx}'] = recv.convolve_history(t_hours, self._J_hist[:, sl])
+                    fields[f'exchange_sw_{mi_idx}'] = recv.convolve_history(t_hours, self._Eout_hist[:, sl])
+                if sh.mode == 'uv':
+                    for name, vals in fields.items():
+                        grid = np.full(sh.res[0] * sh.res[1], np.nan)
+                        grid[sh.idx] = vals
+                        grid = np.where(np.isfinite(grid), grid, float(np.nanmean(grid))).astype(np.float32).reshape(sh.res)
+                        em[name] = {'type': 'bitmap', 'bitmap': mi.Bitmap(np.ascontiguousarray(grid[..., None])),
+                                    'raw': True, 'filter_type': 'bilinear', 'wrap_mode': 'clamp'}
+                else:
+                    if mesh_dir is None:
+                        mesh_dir = tempfile.mkdtemp(prefix='mitsuba_ir_thermal_')
+                    os.makedirs(mesh_dir, exist_ok=True)
+                    mesh = sh.shape
+                    for name, vals in fields.items():
+                        if mesh.has_attribute('vertex_' + name):
+                            mesh.remove_attribute('vertex_' + name)
+                        mesh.add_attribute('vertex_' + name, mi.TensorXf(np.asarray(vals, dtype=np.float32).reshape(-1, 1)))
+                        em[name] = {'type': 'mesh_attribute', 'name': 'vertex_' + name}
+                    path = os.path.join(mesh_dir, f"{key}_dyn_{t_hours:05.2f}.ply".replace('.', '_', 1))
+                    mesh.write_ply(path)
+                    new_node = {k: v for k, v in node.items() if k not in ('type', 'to_world', 'filename',
+                                                                          'face_normals', 'flip_normals')}
+                    new_node.update({'type': 'ply', 'filename': path})
+                    out[key] = new_node
+                    node = new_node
+            node['emitter'] = em
         if default_temperature is not None:
             from ..scene import thermalize
             out = thermalize(out, temperature=float(default_temperature), twosided=twosided, in_place=True)
@@ -465,6 +624,7 @@ class ThermalScene:
 
         n_steps = int(round(24 * 3600.0 / dt))
         dt = 24 * 3600.0 / n_steps
+        self._hist_dt = dt
         # Precompute forcing on the diurnal grid (periodic)
         t_grid = (np.arange(n_steps) + 0.5) * dt / 3600.0
         irr = w.irradiance(t_grid)
@@ -484,19 +644,54 @@ class ThermalScene:
         records = {key: [] for key in self.shapes}
         from .dynamic import step_index
         rec_steps = {step_index(t, dt, n_steps): t for t in out_times}
+
+        # Global per-element constants
+        NE = self.n_elements
+        eps_e = np.zeros(NE)
+        alpha_e = np.zeros(NE)
+        F_e = np.zeros(NE)
+        fo_e = np.zeros(NE)
+        for key in self._keys:
+            sh = self.shapes[key]
+            sl = slice(self._offsets[key], self._offsets[key] + sh.E)
+            eps_e[sl] = sh.material.emissivity
+            alpha_e[sl] = sh.material.alpha_solar
+            F_e[sl] = sh.F_sky
+            fo_e[sl] = sh.f_other if self.exchange else (sh.f_other + sh.f_sim)
+        LW_in_prev = np.zeros(NE)
+        E_inc_prev = np.zeros(NE)
+        self._J_hist = np.zeros((n_steps, NE), dtype=np.float32)      # longwave radiosity history (last day)
+        self._Eout_hist = np.zeros((n_steps, NE), dtype=np.float32)   # reflected solar history (last day)
+
         for day in range(int(days)):
             for s in range(n_steps):
                 dni, dhi, ghi = float(irr['dni'][s]), float(irr['dhi'][s]), float(irr['ghi'][s])
                 Ta, Lsky = float(T_air[s]), float(L_sky[s])
                 T_sur = Ta if self.T_surroundings is None else self.T_surroundings
                 vis = vis_cache[s]
-                for key, sh in self.shapes.items():
-                    m = sh.material
-                    F = sh.F_sky
-                    direct = dni * vis[key] if vis is not None else 0.0
-                    E_abs = m.alpha_solar * (direct + F * dhi + (1.0 - F) * w.ground_albedo * ghi)
-                    L_eff = F * Lsky + (1.0 - F) * SIGMA_SB * T_sur ** 4
-                    cols[key].step(dt, E_abs, L_eff, Ta, h, T_air_back=Ta, L_back=None)
+                # Current surface temperatures and direct solar term of all elements
+                T_e = np.concatenate([cols[key].surface for key in self._keys])
+                direct = np.concatenate([(dni * vis[key]) if vis is not None else np.zeros(self.shapes[key].E)
+                                         for key in self._keys])
+                # Radiosities of the simulated elements (one-bounce lag)
+                J = eps_e * SIGMA_SB * T_e ** 4 + (1.0 - eps_e) * LW_in_prev
+                E_out = (1.0 - alpha_e) * E_inc_prev
+                if self.exchange:
+                    LW_sim = self.exchange_apply(J)
+                    E_refl_sim = self.exchange_apply(E_out)
+                else:
+                    LW_sim = 0.0
+                    E_refl_sim = 0.0
+                LW_in = F_e * Lsky + LW_sim + fo_e * SIGMA_SB * T_sur ** 4
+                E_refl = E_refl_sim + fo_e * w.ground_albedo * ghi
+                E_inc = direct + F_e * dhi + E_refl
+                self._J_hist[s] = J
+                self._Eout_hist[s] = E_out
+                for key in self._keys:
+                    sh = self.shapes[key]
+                    sl = slice(self._offsets[key], self._offsets[key] + sh.E)
+                    cols[key].step(dt, sh.material.alpha_solar * E_inc[sl], LW_in[sl], Ta, h, T_air_back=Ta, L_back=None)
+                LW_in_prev, E_inc_prev = LW_in, E_inc
                 if day == int(days) - 1 and s in rec_steps:
                     for key in self.shapes:
                         records[key].append(cols[key].surface.copy())

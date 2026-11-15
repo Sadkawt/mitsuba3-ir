@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.6 — Phase 3b (scene temperatures; shading-time evaluation; thermal properties derived from the BSDF) |
+| **Version** | 0.7 — Phase 3b (scene temperatures; shading-time evaluation; BSDF-derived properties; radiative exchange between surfaces) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -946,6 +946,62 @@ Validation (`test_ir_thermal.py::test08`): constant diffuse 0.3 →
 ε ≈ 0.02; fixed-incidence albedo of a smooth conductor equals 1 − F(0) to
 10⁻³; `ThermalScene` adopts the derived values and warns.
 
+#### 6.8.5 Radiative exchange between scene surfaces
+
+> **A23 — Longwave and shortwave exchange between the resolved surfaces.**
+> The hemisphere rays that give the sky-view factor also record which
+> simulated element they hit, yielding a sparse view-factor matrix M (rows
+> sum to 1 − F_sky − f_other). Each element then receives, in the
+> per-element solver, L_in = F_sky L_sky + Σ_j M_ij J_j + f_other σT_sur⁴ and
+> E_refl = Σ_j M_ij (1 − α_j) E_inc,j + f_other ρ_g E_gh, with the radiosity
+> J_j = ε_j σT_j⁴ + (1 − ε_j) L_in,j (one-bounce lag: the previous step's
+> incident flux) and E_inc,j the total shortwave incident on j. Directions
+> hitting non-simulated geometry or the lower hemisphere keep the generic
+> surroundings. In the shading-time model the exchange enters through
+> smooth per-shape fields: for every receiver material m,
+> H^{(m)}_j(y) = Σ_k G_m,per(lag_k) J_j(y, t_k) and the analogous S^{(m)}_j
+> from the reflected shortwave, stored as textures on the emitting shape;
+> a receiver's sky rays that hit shape j add ε_x (H − H_air) + α_x (S −
+> S_ref) per ray, where H_air, S_ref are the receiver's generic-surroundings
+> baselines.
+
+*Motivation.* The generic-surroundings assumption (A18) is the largest
+remaining approximation of the energy balance in built-up scenes: a wall
+base facing sunlit asphalt at 50 °C receives ≈ 160 W m⁻² more longwave
+than from air at 26 °C; canyon floors and walls exchange radiation with
+each other instead of with a sky 40 K colder; the ground under a vehicle
+sees its underbody. Radiosity with view factors is the standard treatment
+of such enclosures [5 §5–6, 6 §5]; here the view factors are Monte Carlo
+estimates from the same cosine-weighted rays as F_sky, hence consistent
+with it and free of any additional geometric approximation. Infinite
+reflections are truncated after one bounce with a one-step lag, adequate
+for ε ≥ 0.9 surfaces (the second-order term is < 1 % of the first); for
+low-emissivity enclosures (metal interiors) the error grows and a full
+radiosity solve would be needed. The split between a sharp direct term and
+smooth exchange fields in the shading-time model is the classic
+direct/indirect separation of global illumination: the exchange term is an
+integral over the hemisphere *and* over hours, hence smooth, and its
+interpolation from the per-element resolution introduces an error that is
+second order compared with the direct term's.
+
+*Validation.* Two black plates in polar night (`test09`): the equilibrium
+of a plate facing a 330 K plate is reproduced to < 0.3 K for both the
+exchange and the air-only models, which differ by tens of kelvin; a
+north-facing wall above sunlit asphalt is > 1 K warmer with exchange
+(`test10`); the shading-time model with exchange fields reproduces the
+per-element solver under a roof whose underside the ground sees
+(`test_ir_thermal_dynamic::test06`, < 1.2 K max, < 0.6 K mean under the
+roof) and renders the expected radiance there. Example 12 shows the street
+canyon at 22:00: with exchange the canyon floor and the wall bases remain
+several kelvin warmer than open ground, and the ground under a heated
+vehicle is warmer still.
+
+*Cost.* Negligible in the per-element solver (one sparse product per step)
+and in the shading-time model (the sky rays become `ray_intersect` queries
+with one texture lookup); the first run of a new kernel configuration
+incurs a one-time JIT compilation of a few minutes for the CUDA/LLVM
+variants, cached afterwards.
+
 ---
 
 ## 7. Helper library and examples
@@ -971,6 +1027,7 @@ Validation (`test_ir_thermal.py::test08`): constant diffuse 0.3 →
 | `thermal.ThermalScene`, `thermal.ThermalResult` | Scene sampling, shadows, sky view, time integration, temperature textures (Section 6.8.1–2) |
 | `thermal.ThermalScene.dynamic`, `thermal.DynamicModel` | Shading-time (linear-response) model: `thermal_dynamic` emitters evaluated by the integrators (Section 6.8.3) |
 | `two_band_diffuse`, `albedo_spectrum`, `bsdf_thermal_properties` | Spectrally consistent diffuse materials; α_s and ε from a BSDF (Section 6.8.4) |
+| `ThermalScene(exchange=True)`, `exchange_apply`, `ThermalScene.dynamic(exchange=...)` | Surface-to-surface radiative exchange (Section 6.8.5) |
 | `materials.rii_to_nk`, `write_spd` | Conversion of refractiveindex.info pages (formulas 1–7 and tabulated data) |
 
 ### 7.2 Examples (`examples/ir/`)
@@ -988,6 +1045,7 @@ Validation (`test_ir_thermal.py::test08`): constant diffuse 0.3 →
 | `09_hitran_transmittance.py` | HITRAN H₂O + CO₂ transmittance over 1 km, 2.5–5.5 and 6.5–15.5 µm, with/without RSB continuum; attenuated sun and air medium | Window edges at 7.5–8 µm (H₂O) and 13.5–14 µm (CO₂), CO₂ 4.3 µm band opaque, continuum slope in the window |
 | `10_thermal_solver.py` | `mitsuba.ir.thermal`: asphalt, concrete wall, heated steel box, tree in Stockholm on 2026-07-15; probes through the day, LWIR renders at 08/14/20 h, diurnal curves | Moving optical shadows with lagging thermal shadows; asphalt 16–49 °C, wall 18–27 °C, box 30–40 °C |
 | `11_thermal_dynamic.py` | Same scene at 14:00 with `thermal_dynamic` emitters vs the 25 cm texture solver, close-up of the wall/tree shadows, timings | Resolution-free shadow edges; cost scales with shading points |
+| `12_radiative_exchange.py` | Street canyon with a heated vehicle at 22:00, with/without surface-to-surface exchange; probes and difference image | Canyon floor and wall bases several kelvin warmer with exchange; ground under the vehicle warmer still |
 
 ---
 
@@ -1091,7 +1149,7 @@ given a correspondingly large `sampling_weight`; see Section 4.4.
 | 1 | Thermal emission of surfaces, Kirchhoff coupling, `path_ir`, validation | ✅ |
 | 2 | IR material data (Section 6), `mitsuba.ir` helpers, examples | ✅ |
 | 3 | Emissive media (`volpath_ir`, medium `temperature`), `thermalsky`, Idso clear-sky emissivity, HITRAN transmittance | ✅ |
-| 3b | Scene temperatures: `mitsuba.ir.thermal` energy-balance solver with scene shadows, parametrised weather, internal heat; shading-time evaluation (`thermal_dynamic`) | ✅ |
+| 3b | Scene temperatures: `mitsuba.ir.thermal` energy-balance solver with scene shadows, parametrised weather, internal heat; shading-time evaluation (`thermal_dynamic`); BSDF-derived α_s/ε; surface-to-surface radiative exchange | ✅ |
 | 4 | Sensor model: detector response curves [40], apparent-temperature output, NETD noise model | 📝 |
 | 5 | Polarized thermal emission; multiple-scattering microfacet BSDFs [22]; differentiable temperature | 📝 |
 
@@ -1109,8 +1167,9 @@ Known limitations of the present state:
   isothermal slab at the screen-level air temperature.
 * Residual ≈ 0.5 % in long near-specular rough-conductor paths (Section 8).
 * Thermal solver: no lateral conduction, no evapotranspiration or
-  precipitation, surroundings linearised to T_air, periodic single-day
-  forcing; α_s is hemispherical rather than incidence-dependent (A17–A22).
+  precipitation, periodic single-day forcing; α_s is hemispherical rather
+  than incidence-dependent; surface exchange truncated after one bounce
+  with a one-step lag; non-simulated geometry at T_air (A17–A23).
 
 ---
 
@@ -1260,6 +1319,7 @@ Known limitations of the present state:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-15 | 0.7 | Radiative exchange between simulated surfaces: sparse view factors from the hemisphere rays, longwave radiosity (one bounce) and shortwave inter-reflection in the per-element solver; exchange fields per receiver material (`exchange_lw_<m>`, `exchange_sw_<m>`) and `Emitter::thermal_exchange()` in the shading-time model; `ThermalScene` loads with `optimize=False` (the parser merges meshes sharing a BSDF); 3 tests, example 12, assumption A23. |
 | 2026-11-13 | 0.6 | α_s and ε of the thermal solver derived from the BSDF (`bsdf_thermal_properties`, `albedo_spectrum`, `two_band_diffuse`; `ThermalScene(material_from_bsdf=True)` default with disagreement warning); examples 10/11 use spectrally consistent materials; assumption A22. |
 | 2026-11-13 | 0.5 | Shading-time thermal model: `thermal_dynamic` emitter, `EmitterFlags::ThermalDynamic`, `Emitter::thermal_*()` accessors, `thermal_dynamic_temperature()` in `path_ir`/`volpath_ir` (hits and NEE), `DynamicModel` / `ThermalScene.dynamic()`, 5 tests, example 11, assumption A21, references [68, 69]. |
 | 2026-11-12 | 0.4 | Phase 3b: `mitsuba.ir.thermal` (solar geometry, Bird clear sky, parametrised weather, 1-D energy-balance solver with scene shadows and sky-view factors, materials table, temperature textures), 7 tests, example 10, assumptions A17–A20, references [56]–[67]. |

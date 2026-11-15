@@ -74,12 +74,13 @@ Wavelength planck_radiance(const Wavelength &wavelengths, const Float &T) {
  * \param time     Ray time
  */
 template <typename Float, typename Spectrum, typename Scene, typename EmitterPtr,
-          typename Sampler>
+          typename Sampler, typename Wavelength>
 Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
                                   const Point<Float, 3> &p, const Normal<Float, 3> &n,
                                   const Vector<dr::scalar_t<Float>, 3> &up, Sampler *sampler,
                                   uint32_t sky_rays, const Float &time,
-                                  dr::mask_t<Float> active) {
+                                  const Wavelength &wavelengths, dr::mask_t<Float> active) {
+    DRJIT_MARK_USED(wavelengths);
     using Mask     = dr::mask_t<Float>;
     using UInt32   = dr::uint32_array_t<Float>;
     using Vector3f = Vector<Float, 3>;
@@ -116,36 +117,52 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
             Vector3f s = dr::select(w1 != ScalarFloat(0), dr::normalize(s0 + u_time * (s1 - s0)), s0);
             Float cos_i = dr::dot(n, s);
             Mask lit = active && (cos_i > ScalarFloat(1e-4)) && (w != ScalarFloat(0));
-            Ray3f ray(o, s, time);
+            Ray3f ray(o, s, time, wavelengths);
             Mask occluded = scene->ray_test(ray, Mask(false), UInt32((uint32_t) RayMask::Secondary), lit);
             dr::masked(l.acc, lit && !occluded) += w * cos_i;
             l.k += 1;
         });
 
-    // --- sky-view factor: cosine-weighted hemisphere rays ---------------------
+    // --- sky-view factor and radiative exchange: cosine-weighted hemisphere rays
+    // A direction either reaches the sky (unoccluded and above the horizon),
+    // hits another thermal-dynamic surface whose exchange fields give the
+    // deviation of its radiosity history from the generic surroundings, or
+    // hits other geometry / the lower hemisphere (generic surroundings: no
+    // correction).
+    Float alpha = emitter->thermal_alpha(),
+          eps   = emitter->thermal_emissivity();
     Float F_sky = 1.f;
+    Float dT_exchange = 0.f;
     if (sky_rays > 0) {
         Frame<Float> frame(n);
         Float visible = 0.f;
+        UInt32 m_recv = emitter->thermal_material_index();
+        Float h_air = emitter->thermal_h_air(),
+              s_ref = emitter->thermal_s_ref();
         for (uint32_t i = 0; i < sky_rays; ++i) {
             Point<Float, 2> u = sampler->next_2d(active);
             Vector3f d_local = warp::square_to_cosine_hemisphere(u);
             Vector3f d = frame.to_world(d_local);
             Mask above = dr::dot(d, Vector3f(up)) > ScalarFloat(0);
-            Mask occluded = scene->ray_test(Ray3f(o, d, time), Mask(false),
-                                            UInt32((uint32_t) RayMask::Secondary), active && above);
-            dr::masked(visible, above && !occluded) += ScalarFloat(1);
+            Ray3f ray(o, d, time, wavelengths);
+            auto si_hit = scene->ray_intersect(ray, +RayFlags::Default, Mask(false),
+                                               UInt32((uint32_t) RayMask::Secondary), active);
+            Mask hit = si_hit.is_valid();
+            dr::masked(visible, above && !hit) += ScalarFloat(1);
+            auto hit_emitter = si_hit.emitter(scene, UInt32((uint32_t) RayMask::Secondary), hit);
+            auto [d_lw, d_sw] = hit_emitter->thermal_exchange(si_hit, m_recv, h_air, s_ref, hit);
+            dr::masked(dT_exchange, hit) += eps * d_lw + alpha * d_sw;
         }
         F_sky = visible / ScalarFloat(sky_rays);
+        dT_exchange /= ScalarFloat(sky_rays);
     }
 
     // --- linear response and quasi-steady correction ---------------------------
-    Float alpha  = emitter->thermal_alpha(),
-          dT_lin = alpha * (ls.acc - emitter->thermal_c_ref())
-                   + (F_sky - ScalarFloat(1)) * emitter->thermal_c_sky();
+    Float dT_lin = alpha * (ls.acc - emitter->thermal_c_ref())
+                   + (F_sky - ScalarFloat(1)) * emitter->thermal_c_sky()
+                   + dT_exchange;
     Float h_lin  = emitter->thermal_h_total(),
           h_conv = emitter->thermal_h_conv(),
-          eps    = emitter->thermal_emissivity(),
           t_ref  = emitter->thermal_t_ref();
     // Quasi-steady correction for the temperature dependence of the
     // radiative conductance: the response function was linearised with the

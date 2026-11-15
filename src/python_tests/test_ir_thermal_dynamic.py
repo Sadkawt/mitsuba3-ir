@@ -41,7 +41,7 @@ def test02_dynamic_matches_texture_solver(variants_vec_backends_once_spectral):
         'roof': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 2, 0]).rotate([1, 0, 0], -90).scale(3)},
     }
     ts = th.ThermalScene(scene, w, {'ground': th.MATERIALS['asphalt']}, resolution=24,
-                         up=(0, 1, 0), north=(0, 0, -1), sky_rays=64)
+                         up=(0, 1, 0), north=(0, 0, -1), sky_rays=64, exchange=False)
     dt = 600.0
     times = [6.0, 11.0, 14.0, 17.0, 22.0]
     res = ts.run(days=4, dt=dt, output_times=times)
@@ -155,3 +155,75 @@ def test05_volpath_ir_evaluates_dynamic(variants_vec_backends_once_spectral):
     model = ts.dynamic_models()['ground']
     from mitsuba.ir.thermal.dynamic import step_index
     assert abs(vals[0] - model.T_ref[step_index(13.0, model.dt, model.n_steps)]) < 0.3
+
+
+def test06_exchange_dynamic_matches_texture(variants_vec_backends_once_spectral):
+    # Roof over asphalt with radiative exchange: the ground under the roof
+    # sees the (warm) roof underside. The shading-time model with exchange
+    # fields must reproduce the per-element solver.
+    from mitsuba.ir import thermal as th
+    w = _weather()
+    scene = {
+        'type': 'scene',
+        'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(10),
+                   'bsdf': {'type': 'diffuse', 'reflectance': 0.08}},
+        'roof': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 2, 0]).rotate([1, 0, 0], -90).scale(3),
+                 'bsdf': {'type': 'diffuse', 'reflectance': 0.25}},
+    }
+    mats = {'ground': th.MATERIALS['asphalt'], 'roof': th.MATERIALS['steel_sheet_painted']}
+    ts = th.ThermalScene(scene, w, mats, resolution=24, up=(0, 1, 0), north=(0, 0, -1), sky_rays=64, exchange=True)
+    dt = 600.0
+    t = 14.0
+    res = ts.run(days=4, dt=dt, output_times=[t])
+    d = ts.dynamic(scene, t, dt=dt, days=4)
+    assert 'exchange_lw_0' in d['ground']['emitter'] and 'exchange_lw_1' in d['ground']['emitter']
+    # Compare the NumPy reference formula (with the texel's own shadow history,
+    # sky view and exchange view factors) with the solver, texel by texel
+    sh = ts.shapes['ground']
+    model = ts.dynamic_models(dt=dt)['ground']
+    models = ts.dynamic_models(dt=dt)
+    hist = np.array([v['ground'] if v is not None else np.zeros(sh.E) for v in ts._vis_cache])
+    T_tex = res.temperature('ground', t).ravel()[sh.idx]
+    # exchange term: sum over view-factor entries of the ground rows
+    base = ts._offsets['ground']
+    rows, cols, wv = ts._vf_rows, ts._vf_cols, ts._vf_w
+    sel = (rows >= base) & (rows < base + sh.E)
+    H_lw = model.convolve_history(t, ts._J_hist)       # per element, receiver = ground material
+    H_sw = model.convolve_history(t, ts._Eout_hist)
+    h_air, s_ref = model.baselines(t)
+    m = sh.material
+    exch = np.bincount(rows[sel] - base, weights=wv[sel] * (m.emissivity * (H_lw[cols[sel]] - h_air)
+                                                           + m.alpha_solar * (H_sw[cols[sel]] - s_ref)), minlength=sh.E)
+    T_dyn = np.array([model.temperature(t, hist[:, e], F_sky=sh.F_sky[e]) for e in range(sh.E)])
+    # add the exchange deviation inside the correction (same as the integrator): recompute with it
+    from mitsuba.ir.thermal.dynamic import step_index
+    s_now = step_index(t, model.dt, model.n_steps)
+    T_dyn2 = []
+    for e in range(sh.E):
+        g = model.G_per[model._lags(t)]
+        wk = g * model.dni
+        q_sky = (m.alpha_solar * (model.dhi - w.ground_albedo * model.ghi) + m.emissivity * (model.L_sky - 5.670374419e-8 * model.T_air ** 4))
+        dT = m.alpha_solar * (np.sum(wk * hist[:, e]) - np.sum(wk * model.cos_ref)) + (sh.F_sky[e] - 1) * np.sum(g * q_sky) + exch[e]
+        T_mid = model.T_ref[s_now] + 0.5 * dT
+        h_act = model.h_conv + 4 * m.emissivity * 5.670374419e-8 * T_mid ** 3
+        T_dyn2.append(model.T_ref[s_now] + dT * model.h_total / max(h_act, 0.25 * model.h_total))
+    T_dyn2 = np.array(T_dyn2)
+    under = sh.F_sky < 0.5
+    assert under.any()
+    assert np.abs(T_dyn2 - T_tex).max() < 1.2, np.abs(T_dyn2 - T_tex).max()
+    assert np.abs(T_dyn2 - T_tex)[under].mean() < 0.6
+    # Rendering the dynamic scene reproduces the texture solver under the roof
+    # (radiancemeter looking at the centre of the ground from below the roof)
+    from mitsuba import ir
+    d['integrator'] = {'type': 'path_ir', 'max_depth': 2, 'thermal_up': [0, 1, 0], 'thermal_sky_rays': 64}
+    d['sensor'] = {'type': 'radiancemeter',
+                   'to_world': mi.ScalarTransform4f().look_at(origin=[0, 1.0, 0], target=[0, 0, 0], up=[0, 0, -1]),
+                   'sampler': {'type': 'independent', 'sample_count': 16},
+                   'film': ir.band_film((9990.0, 10010.0), 1, 1, rfilter='box')}
+    L = float(np.array(mi.render(mi.load_dict(d), spp=16)).ravel()[0])
+    # asphalt diffuse 0.08 -> emissivity 0.92 at 10 um; it reflects 8 % of the roof underside
+    T_app = ir.apparent_temperature(L, 9990.0, 10010.0)
+    T_centre = res.temperature('ground', t)[12, 12]
+    T_roof = res.temperature('roof', t).mean()
+    L_ref = 0.92 * ir.band_radiance(9990.0, 10010.0, T_centre) + 0.08 * (0.75 * ir.band_radiance(9990.0, 10010.0, T_roof) + 0.25 * 0)
+    assert abs(T_app - ir.apparent_temperature(L_ref, 9990.0, 10010.0)) < 2.0, (T_app, T_centre, T_roof)

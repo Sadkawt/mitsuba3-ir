@@ -4,6 +4,7 @@
 #include <mitsuba/render/emitter.h>
 #include <mitsuba/render/medium.h>
 #include <mitsuba/render/shape.h>
+#include <mitsuba/render/texture.h>
 #include <mitsuba/render/thermal.h>
 #include <drjit/traversable_base.h>
 
@@ -51,6 +52,20 @@ Shading-time thermal emitter (:monosp:`thermal_dynamic`)
    - Surface conductance :math:`h_{conv} + 4\varepsilon\sigma T_{lin}^3` used to
      linearise the response function, the convective coefficient and the
      broadband emissivity, used for the quasi-steady nonlinearity correction.
+
+ * - material_index, h_air, s_ref
+   - |int|, |float|, |float|
+   - Receiver index of this shape's thermal material into the exchange fields
+     and the baselines of the longwave / shortwave exchange fields for that
+     material (:math:`\sum_k G_k \sigma T_{air,k}^4`, :math:`\sum_k G_k \rho_g E_{gh,k}`) [K].
+
+ * - exchange_lw_<m>, exchange_sw_<m>
+   - |texture|
+   - Radiative-exchange fields of *this* surface for receivers of thermal
+     material ``m``: the convolution of its longwave radiosity / reflected
+     solar irradiance history with the receiver's response function [K per
+     unit view factor]. Produced by ``ThermalScene.dynamic()`` from the
+     per-element solver; optional.
 
  * - twosided
    - |bool|
@@ -101,6 +116,18 @@ public:
         m_h_conv  = props.get<ScalarFloat>("h_conv", 0.f);
         m_eps     = props.get<ScalarFloat>("emissivity", 0.9f);
         m_twosided = props.get<bool>("twosided", true);
+        m_material_index = (uint32_t) props.get<int>("material_index", 0);
+        m_h_air = props.get<ScalarFloat>("h_air", 0.f);
+        m_s_ref = props.get<ScalarFloat>("s_ref", 0.f);
+        for (uint32_t m = 0; ; ++m) {
+            std::string lw = "exchange_lw_" + std::to_string(m),
+                        sw = "exchange_sw_" + std::to_string(m);
+            if (!props.has_property(lw))
+                break;
+            m_exchange_lw.push_back(props.get_texture<Texture>(lw));
+            m_exchange_sw.push_back(props.has_property(sw) ? props.get_texture<Texture>(sw)
+                                                           : props.get_texture<Texture>(lw, 0.f));
+        }
 
         std::vector<ScalarFloat> w = parse_list(props.get<std::string_view>("weights", ""));
         std::vector<ScalarFloat> d = parse_list(props.get<std::string_view>("sun_directions", ""));
@@ -158,6 +185,24 @@ public:
     ScalarFloat thermal_h_total() const override { return m_h_total; }
     ScalarFloat thermal_h_conv() const override { return m_h_conv; }
     ScalarFloat thermal_emissivity() const override { return m_eps; }
+    uint32_t thermal_material_index() const override { return m_material_index; }
+    ScalarFloat thermal_h_air() const override { return m_h_air; }
+    ScalarFloat thermal_s_ref() const override { return m_s_ref; }
+
+    std::pair<Float, Float> thermal_exchange(const SurfaceInteraction3f &si, UInt32 m,
+                                             Float h_air, Float s_ref, Mask active) const override {
+        if (m_exchange_lw.empty())
+            return { 0.f, 0.f };
+        Float lw = 0.f, sw = 0.f;
+        Mask any = false;
+        for (uint32_t i = 0; i < (uint32_t) m_exchange_lw.size(); ++i) {
+            Mask sel = active && (m == i);
+            dr::masked(lw, sel) = m_exchange_lw[i]->eval_1(si, sel) - h_air;
+            dr::masked(sw, sel) = m_exchange_sw[i]->eval_1(si, sel) - s_ref;
+            any |= sel;
+        }
+        return { dr::select(any, lw, 0.f), dr::select(any, sw, 0.f) };
+    }
 
     // --- emitter interface: the reference temperature is used where the
     //     integrator does not evaluate the dynamic model -------------------------
@@ -286,12 +331,13 @@ public:
 
     MI_DECLARE_CLASS(ThermalDynamicEmitter)
 private:
-    ScalarFloat m_t_ref, m_alpha, m_c_ref, m_c_sky, m_h_total, m_h_conv, m_eps;
+    ScalarFloat m_t_ref, m_alpha, m_c_ref, m_c_sky, m_h_total, m_h_conv, m_eps, m_h_air, m_s_ref;
     bool m_twosided;
-    uint32_t m_steps;
+    uint32_t m_steps, m_material_index;
     FloatStorage m_weights, m_sun_x, m_sun_y, m_sun_z;
+    std::vector<ref<Texture>> m_exchange_lw, m_exchange_sw;
 
-    MI_TRAVERSE_CB(Base, m_weights, m_sun_x, m_sun_y, m_sun_z)
+    MI_TRAVERSE_CB(Base, m_weights, m_sun_x, m_sun_y, m_sun_z, m_exchange_lw, m_exchange_sw)
 };
 
 MI_EXPORT_PLUGIN(ThermalDynamicEmitter)

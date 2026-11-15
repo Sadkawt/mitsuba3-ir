@@ -163,6 +163,16 @@ class DynamicModel:
             emissivity=float(self.m.emissivity),
         )
 
+    def baselines(self, t_hours):
+        """(h_air, s_ref): sum_k G_per(lag_k) sigma T_air,k^4 and sum_k G_per(lag_k) rho_g GHI_k [K]."""
+        g = self.G_per[self._lags(t_hours)]
+        return float(np.sum(g * SIGMA_SB * self.T_air ** 4)), float(np.sum(g * self.w.ground_albedo * self.ghi))
+
+    def convolve_history(self, t_hours, history):
+        """sum_k G_per(lag_k) history[k, :] for a (n_steps, E) history [W m^-2] -> K per unit view factor."""
+        g = self.G_per[self._lags(t_hours)]
+        return g @ np.asarray(history, dtype=np.float64)
+
     def emitter_dict(self, t_hours, twosided=True):
         """``thermal_dynamic`` emitter dictionary at local time ``t_hours``."""
         tb = self.tables(t_hours)

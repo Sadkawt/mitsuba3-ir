@@ -230,7 +230,7 @@ public:
                 if (dr::any_or<true>(is_dyn)) {
                     Float T = thermal_dynamic_temperature<Float, Spectrum>(
                         scene, emitter, si.p, si.n, m_thermal_up, ls.sampler,
-                        m_sky_rays, si.time, is_dyn);
+                        m_sky_rays, si.time, si.wavelengths, is_dyn);
                     if constexpr (is_spectral_v<Spectrum>)
                         dr::masked(L_e, is_dyn) = depolarizer<Spectrum>(
                             planck_radiance(si.wavelengths, T));
@@ -298,7 +298,7 @@ public:
                 if (dr::any_or<true>(dyn_em)) {
                     Float T = thermal_dynamic_temperature<Float, Spectrum>(
                         scene, ds.emitter, ds.p, ds.n, m_thermal_up, ls.sampler,
-                        m_sky_rays, si.time, dyn_em);
+                        m_sky_rays, si.time, si.wavelengths, dyn_em);
                     if constexpr (is_spectral_v<Spectrum>) {
                         UnpolarizedSpectrum B     = planck_radiance(si.wavelengths, T),
                                             B_ref = planck_radiance(si.wavelengths,

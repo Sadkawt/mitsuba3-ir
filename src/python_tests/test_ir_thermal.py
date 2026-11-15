@@ -132,8 +132,11 @@ def test06_thermal_scene_shadows_and_textures(variants_vec_backends_once_spectra
         'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(10)},
         'roof': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 2, 0]).rotate([1, 0, 0], -90).scale(3)},
     }
+    # exchange=False: this test checks shadows and the texture round trip;
+    # with exchange on, the ground under the roof also sees the warm roof
+    # underside, which reduces the shadow contrast (see test09/test10)
     ts = th.ThermalScene(scene, w, {'ground': th.MATERIALS['asphalt'], 'roof': th.MATERIALS['steel_sheet_painted']},
-                         resolution=32, up=(0, 1, 0), north=(0, 0, -1), sky_rays=32)
+                         resolution=32, up=(0, 1, 0), north=(0, 0, -1), sky_rays=32, exchange=False)
     assert ts.shapes['ground'].mode == 'uv'        # rectangle: a mesh with a unique UV map
     F = ts.shapes['ground'].F_sky
     assert F.min() < 0.3 and F.max() > 0.98        # under the roof vs. open ground
@@ -232,3 +235,66 @@ def test08_material_from_bsdf(variants_vec_backends_once_spectral):
     ts2 = th.ThermalScene(scene, w, {'ground': th.MATERIALS['concrete']}, resolution=4, up=(0, 1, 0), north=(0, 0, -1),
                           sky_rays=4, material_from_bsdf=False)
     assert ts2.shapes['ground'].material.alpha_solar == th.MATERIALS['concrete'].alpha_solar
+
+
+def test09_radiative_exchange_two_plates(variants_vec_backends_once_spectral):
+    # Plate B (thin, adiabatic back, facing down) 0.5 m above a large plate A
+    # held at T_A. Polar night, constant air temperature: B's equilibrium is
+    #   eps sigma T_B^4 = eps [f_A J_A + f_other sigma T_air^4] + h (T_air - T_B)
+    from mitsuba.ir import thermal as th
+    from mitsuba.ir.thermal.heat import SIGMA_SB
+    T_A, T_air = 330.0, 265.0
+    w = th.Weather('2026-12-21', 80.0, 0.0, utc_offset=0, T_min=T_air, T_max=T_air, wind_speed=2.0)
+    assert float(w.irradiance(12.0)['ghi']) == 0.0
+    scene = {
+        'type': 'scene',
+        'A': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(50),
+              'bsdf': {'type': 'diffuse', 'reflectance': 0.1}},
+        'B': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 0.5, 0]).rotate([1, 0, 0], 90).scale(1),
+              'bsdf': {'type': 'diffuse', 'reflectance': 0.1}},
+    }
+    # Black plates (eps = 1): no reflected longwave, so the balance below is exact
+    mats = {'A': th.MATERIALS['steel_sheet_insulated'].replace(back='interior', T_internal=T_A, U_internal=1e6,
+                                                               emissivity=1.0),
+            'B': th.MATERIALS['steel_sheet_insulated'].replace(emissivity=1.0)}
+    for exchange in (True, False):
+        ts = th.ThermalScene(scene, w, mats, resolution=8, up=(0, 1, 0), north=(0, 0, -1), sky_rays=64,
+                             exchange=exchange, material_from_bsdf=False)
+        shB = ts.shapes['B']
+        assert shB.F_sky.max() < 1e-6                       # B faces down: no sky
+        f_A = shB.f_sim.mean()
+        assert f_A > 0.95
+        res = ts.run(days=2, dt=600.0, output_times=[12.0])
+        T_B = res.temperature('B', 12.0).mean()
+        eps, h = mats['B'].emissivity, w.convection_coefficient()
+        f_other = 1.0 - f_A
+        J_A = eps * SIGMA_SB * T_A ** 4 if exchange else SIGMA_SB * T_air ** 4
+        fA = f_A if exchange else 0.0
+        fo = f_other if exchange else 1.0
+        T = 300.0
+        for _ in range(60):
+            f = eps * (fA * J_A + fo * SIGMA_SB * T_air ** 4 - SIGMA_SB * T ** 4) + h * (T_air - T)
+            T -= f / (-4 * eps * SIGMA_SB * T ** 3 - h)
+        assert abs(T_B - T) < 0.3, (exchange, T_B, T)
+
+
+def test10_wall_sees_hot_ground(variants_vec_backends_once_spectral):
+    # A vertical plate over sunlit asphalt is warmer when it exchanges
+    # radiation with the (hot) ground than with air-temperature surroundings
+    from mitsuba.ir import thermal as th
+    w = th.Weather('2026-07-15', 45.0, 0.0, utc_offset=0, T_min=th.celsius(18), T_max=th.celsius(30), cloud_cover=0.0)
+    scene = {
+        'type': 'scene',
+        'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(30),
+                   'bsdf': {'type': 'diffuse', 'reflectance': 0.08}},
+        'wall': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 1.0, 0]).rotate([0, 1, 0], 180).scale([4, 1, 1]),
+                 'bsdf': {'type': 'diffuse', 'reflectance': 0.3}},   # faces north (-z) -> no direct sun
+    }
+    T = {}
+    for exchange in (True, False):
+        ts = th.ThermalScene(scene, w, {'ground': th.MATERIALS['asphalt'], 'wall': th.MATERIALS['steel_sheet_insulated']},
+                             resolution={'ground': 32, 'wall': 8}, up=(0, 1, 0), north=(0, 0, -1), sky_rays=64,
+                             exchange=exchange, material_from_bsdf=False)
+        res = ts.run(days=3, dt=600.0, output_times=[15.0])
+        T[exchange] = res.temperature('wall', 15.0).mean()
+    assert T[True] - T[False] > 1.0, T

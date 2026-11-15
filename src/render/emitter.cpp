@@ -18,6 +18,12 @@ Emitter<Float, Spectrum>::thermal_forcing(UInt32 /*k*/, Mask /*active*/) const {
     return { dr::zeros<Vector3f>(), 0.f };
 }
 
+MI_VARIANT std::pair<Float, Float>
+Emitter<Float, Spectrum>::thermal_exchange(const SurfaceInteraction3f & /*si*/, UInt32 /*m*/,
+                                           Float /*h_air*/, Float /*s_ref*/, Mask /*active*/) const {
+    return { 0.f, 0.f };
+}
+
 MI_VARIANT void Emitter<Float, Spectrum>::traverse(TraversalCallback *cb) {
     cb->put("sampling_weight", m_sampling_weight, ParamFlags::NonDifferentiable);
 }
