@@ -27,6 +27,7 @@ python 01_lwir_basic.py cuda_ad_spectral
 | `10_thermal_solver.py` | Surface temperatures from the weather (`mitsuba.ir.thermal`): energy balance with shadows and sky-view factors from the scene, thermal lag, internal heat; LWIR renders through the day |
 | `11_thermal_dynamic.py` | Shading-time thermal shadows: `thermal_dynamic` emitters evaluated by `path_ir` at every hit point (no texture, resolution-free) vs the texture solver |
 | `12_radiative_exchange.py` | Surface-to-surface radiative exchange: street canyon with a heated vehicle at night, with/without exchange |
+| `13_timelapse_car.py` | Thermal time-lapse video of a car parked on grass by a tree, using the shading-time model; user-chosen `--start`, `--stop`, `--step` (minutes), plus date, location and weather options (`--help`). Writes PNG frames and an MP4 (GIF without ffmpeg) |
 
 Requirements: a spectral variant of Mitsuba (`scalar_spectral`, `llvm_ad_spectral`
 or `cuda_ad_spectral`), NumPy; matplotlib is used for the figures when available.

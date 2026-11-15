@@ -1050,6 +1050,7 @@ variants, cached afterwards.
 | `10_thermal_solver.py` | `mitsuba.ir.thermal`: asphalt, concrete wall, heated steel box, tree in Stockholm on 2026-07-15; probes through the day, LWIR renders at 08/14/20 h, diurnal curves | Moving optical shadows with lagging thermal shadows; asphalt 16–49 °C, wall 18–27 °C, box 30–40 °C |
 | `11_thermal_dynamic.py` | Same scene at 14:00 with `thermal_dynamic` emitters vs the 25 cm texture solver, close-up of the wall/tree shadows, timings | Resolution-free shadow edges; cost scales with shading points |
 | `12_radiative_exchange.py` | Street canyon with a heated vehicle at 22:00, with/without surface-to-surface exchange; probes and difference image | Canyon floor and wall bases several kelvin warmer with exchange; ground under the vehicle warmer still |
+| `13_timelapse_car.py` | Time-lapse video (command-line start/stop/step, date, location, weather) of a car on grass beside a tree; one per-element solve per day, every frame rendered with `thermal_dynamic` emitters at its own time; fixed colour scale over the sequence | Canopy shadow sweeping across the car with sharp edges; cooling memory of the shaded roof and grass; cabin shadow on the rear deck in the late afternoon |
 
 ---
 
