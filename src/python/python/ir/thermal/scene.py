@@ -301,6 +301,12 @@ class ThermalScene:
                  north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto',
                  material_from_bsdf=True, tolerance=0.05, exchange=True):
         import mitsuba as mi
+        if not (mi.variant().startswith('llvm') or mi.variant().startswith('cuda')):
+            raise RuntimeError(
+                f"ThermalScene requires a JIT variant (llvm_* or cuda_*); the current variant is "
+                f"'{mi.variant()}'. Build the thermal tables under a JIT variant (e.g. with "
+                f"mi.scoped_set_variant('llvm_ad_spectral')); the resulting scene dictionaries "
+                f"render in any spectral variant.")
         self.weather = weather
         self.up = np.asarray(up, dtype=np.float64) / np.linalg.norm(up)
         self.north = np.asarray(north, dtype=np.float64)
@@ -498,7 +504,8 @@ class ThermalScene:
         defined (plates, roofs) and the zenith otherwise (closed objects).
         """
         from .dynamic import DynamicModel
-        key_dt = (float(dt), int(days_memory), int(ref_days))
+        key_dt = (float(dt), int(days_memory), int(ref_days), self.weather.signature(),
+                  tuple(self.up), tuple(self.north))
         cache = getattr(self, '_dyn_cache', {})
         if cache.get('params') != key_dt:
             cache = {'params': key_dt, 'models': {}}
@@ -550,10 +557,9 @@ class ThermalScene:
                 model_list.append(mdl)
         m_index = {key: next(i for i, x in enumerate(model_list) if x is models[key]) for key in models}
         if exchange:
-            if not hasattr(self, '_J_hist') or self._hist_dt != dt or not self.exchange:
-                self.exchange = True
-                self.run(days=days, dt=dt, output_times=[t_hours])
-                self._hist_dt = dt
+            hist_key = (float(dt), self.weather.signature(), True)
+            if getattr(self, '_hist_key', None) != hist_key:
+                self.run(days=days, dt=dt, output_times=[t_hours], exchange=True)
         out = _copy_tree(scene_dict)
         for key, model in models.items():
             node = out.get(key)
@@ -603,7 +609,7 @@ class ThermalScene:
 
     # --- simulation -----------------------------------------------------------
     def run(self, days=3, dt=300.0, output_times=(0, 3, 6, 9, 12, 15, 18, 21), T0=None,
-            progress=False):
+            progress=False, exchange=None):
         """
         Integrate the energy balance over ``days`` repetitions of the diurnal
         cycle (spin-up) and return a :class:`ThermalResult` with the
@@ -624,7 +630,8 @@ class ThermalScene:
 
         n_steps = int(round(24 * 3600.0 / dt))
         dt = 24 * 3600.0 / n_steps
-        self._hist_dt = dt
+        exchange = self.exchange if exchange is None else bool(exchange)
+        self._hist_key = (float(dt), self.weather.signature(), exchange)
         # Precompute forcing on the diurnal grid (periodic)
         t_grid = (np.arange(n_steps) + 0.5) * dt / 3600.0
         irr = w.irradiance(t_grid)
@@ -657,7 +664,7 @@ class ThermalScene:
             eps_e[sl] = sh.material.emissivity
             alpha_e[sl] = sh.material.alpha_solar
             F_e[sl] = sh.F_sky
-            fo_e[sl] = sh.f_other if self.exchange else (sh.f_other + sh.f_sim)
+            fo_e[sl] = sh.f_other if exchange else (sh.f_other + sh.f_sim)
         LW_in_prev = np.zeros(NE)
         E_inc_prev = np.zeros(NE)
         self._J_hist = np.zeros((n_steps, NE), dtype=np.float32)      # longwave radiosity history (last day)
@@ -676,7 +683,7 @@ class ThermalScene:
                 # Radiosities of the simulated elements (one-bounce lag)
                 J = eps_e * SIGMA_SB * T_e ** 4 + (1.0 - eps_e) * LW_in_prev
                 E_out = (1.0 - alpha_e) * E_inc_prev
-                if self.exchange:
+                if exchange:
                     LW_sim = self.exchange_apply(J)
                     E_refl_sim = self.exchange_apply(E_out)
                 else:

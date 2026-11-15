@@ -170,7 +170,8 @@ public:
         Base::traverse(cb);
     }
 
-    void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
+    void parameters_changed(const std::vector<std::string> &keys = {}) override {
+        Base::parameters_changed(keys);
         m_max_density = dr::opaque<Float>(m_scale * m_sigmat->max());
     }
 

@@ -298,3 +298,26 @@ def test10_wall_sees_hot_ground(variants_vec_backends_once_spectral):
         res = ts.run(days=3, dt=600.0, output_times=[15.0])
         T[exchange] = res.temperature('wall', 15.0).mean()
     assert T[True] - T[False] > 1.0, T
+
+
+def test11_solar_azimuth_all_latitudes(variant_scalar_spectral):
+    # Southern hemisphere, December: sunrise in the ESE (azimuth ~118 deg at
+    # 34 S), noon sun due north; equator in December: noon sun due south
+    from mitsuba.ir import thermal as th
+    import datetime as dt
+    w = th.Weather('2026-12-21', -34.0, 151.0, utc_offset=10)
+    rise, set_ = w.sunrise_sunset()
+    az_rise = w.sun(rise + 0.02)['azimuth']
+    assert 112.0 < az_rise < 124.0, az_rise
+    az_set = w.sun(set_ - 0.02)['azimuth']
+    assert 236.0 < az_set < 248.0, az_set
+    # Solar noon at longitude 0 on 21 December: 12:00 UTC minus the equation of
+    # time (+1.9 min) = 11:58 UTC
+    noon = th.solar_position(-34.0, 0.0, dt.datetime(2026, 12, 21, 11, 58))
+    assert abs(noon['azimuth'] - 0.0) < 3.0 or abs(noon['azimuth'] - 360.0) < 3.0
+    eq = th.solar_position(0.0, 0.0, dt.datetime(2026, 12, 21, 11, 58))
+    assert abs(eq['azimuth'] - 180.0) < 3.0
+    assert abs(eq['elevation'] - (90.0 - 23.44)) < 0.3
+    # Northern summer morning unchanged: ~92 deg east at 06:00 UTC in Stockholm
+    sto = th.solar_position(59.33, 18.07, dt.datetime(2026, 6, 21, 6, 0))
+    assert abs(sto['azimuth'] - 92.4) < 0.5

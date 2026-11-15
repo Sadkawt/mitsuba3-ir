@@ -406,14 +406,10 @@ public:
 
                     // Shading-time thermal model (report 6.8.3)
                     Mask is_dyn = active_e && has_flag(emitter->flags(), EmitterFlags::ThermalDynamic);
-                    if (dr::any_or<true>(is_dyn)) {
-                        Float T = thermal_dynamic_temperature<Float, Spectrum>(
+                    if (dr::any_or<true>(is_dyn))
+                        emitted *= depolarizer<Spectrum>(thermal_dynamic_scale<Float, Spectrum>(
                             scene, emitter, si.p, si.n, m_thermal_up, sampler,
-                            m_sky_rays, si.time, si.wavelengths, is_dyn);
-                        if constexpr (is_spectral_v<Spectrum>)
-                            dr::masked(emitted, is_dyn) = depolarizer<Spectrum>(
-                                planck_radiance(si.wavelengths, T));
-                    }
+                            m_sky_rays, si.time, si.wavelengths, is_dyn));
                     dr::masked(B_cur, is_thermal) = emitted;
 
                     Spectrum contrib = dr::select(count_direct, throughput * emitted,
@@ -502,18 +498,10 @@ public:
 
         // Thermal-dynamic emitters: shading-time temperature at the sampled point
         Mask dyn_em = active && has_flag(ds.emitter->flags(), EmitterFlags::ThermalDynamic);
-        if (dr::any_or<true>(dyn_em)) {
-            Float T = thermal_dynamic_temperature<Float, Spectrum>(
+        if (dr::any_or<true>(dyn_em))
+            emitter_val *= depolarizer<Spectrum>(thermal_dynamic_scale<Float, Spectrum>(
                 scene, ds.emitter, ds.p, ds.n, m_thermal_up, sampler,
-                m_sky_rays, ref_interaction.time, ref_interaction.wavelengths, dyn_em);
-            if constexpr (is_spectral_v<Spectrum>) {
-                UnpolarizedSpectrum B     = planck_radiance(ref_interaction.wavelengths, T),
-                                    B_ref = planck_radiance(ref_interaction.wavelengths,
-                                                            Float(ds.emitter->thermal_t_ref()));
-                dr::masked(emitter_val, dyn_em) *= depolarizer<Spectrum>(
-                    dr::select(B_ref > 0.f, B / B_ref, 0.f));
-            }
-        }
+                m_sky_rays, ref_interaction.time, ref_interaction.wavelengths, dyn_em));
 
         if (dr::none_or<false>(active)) {
             return { emitter_val, ds };

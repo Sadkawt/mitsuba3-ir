@@ -71,7 +71,16 @@ class Weather:
     ozone_cm: float = 0.3
     precipitable_water_cm: float = None
     T_deep: float = None
-    _cache: dict = field(default_factory=dict, repr=False)
+    # Derived-value cache; not an init field, so dataclasses.replace() starts empty,
+    # and keyed on the location/date so that mutating the object invalidates it
+    _cache: dict = field(default_factory=dict, repr=False, compare=False, init=False)
+
+    def signature(self):
+        """Tuple of all parameters (identifies the forcing for caches)."""
+        return (self.date, self.latitude, self.longitude, self.utc_offset, self.T_min, self.T_max,
+                self.relative_humidity, self.wind_speed, self.cloud_cover, self.aod500,
+                self.pressure_hPa, self.ground_albedo, self.ozone_cm, self.precipitable_water_cm,
+                self.T_deep)
 
     # --- derived quantities -------------------------------------------------
     @property
@@ -112,6 +121,10 @@ class Weather:
 
     def sunrise_sunset(self):
         """Local times [h] of sunrise and sunset (elevation = -0.833 deg), via a scan."""
+        key = (self.date, self.latitude, self.longitude, self.utc_offset)
+        if self._cache.get('rise_set_key') != key:
+            self._cache.pop('rise_set', None)
+            self._cache['rise_set_key'] = key
         if 'rise_set' not in self._cache:
             t = np.linspace(0.0, 24.0, 24 * 60 + 1)
             el = self.sun(t)['elevation'] + 0.833

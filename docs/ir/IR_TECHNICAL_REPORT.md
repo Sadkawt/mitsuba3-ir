@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.7 — Phase 3b (scene temperatures; shading-time evaluation; BSDF-derived properties; radiative exchange between surfaces) |
+| **Version** | 0.7.1 — Phase 3b (scene temperatures; shading-time evaluation; BSDF-derived properties; radiative exchange between surfaces) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -872,10 +872,14 @@ a texture resolution.
 
 *Bias.* Spatially none. Temporally the forcing discretisation Δt of the
 solver (10 min) is kept for the weights, while the sun *direction* is
-jittered within each step per shading sample (interpolating consecutive
-table entries), so the visibility is integrated over each step rather than
-sampled at its centre: moving shadow edges show no time-step banding, at
-the price of a little noise in the penumbra of the thermal shadow. The
+jittered symmetrically within each step per shading sample (t_k + u Δt,
+u ∈ [−½, ½), along the central-difference tangent of the tabulated sun
+path; table entries are step centres and consecutive daylight steps), so
+the visibility is averaged over each step rather than sampled at its
+centre: moving shadow edges show no time-step banding, at the price of a
+little noise in the penumbra of the thermal shadow. Shadow and sky rays
+cross null-BSDF interfaces (medium boundaries, cut-outs), exactly as the
+integrators do. The
 linearisation about the reference trajectory is the one approximation of
 the formulation; the correction c removes most of it: against the per-texel
 nonlinear solver, the roof-over-asphalt scene is reproduced to a mean of
@@ -1319,6 +1323,7 @@ Known limitations of the present state:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-15 | 0.7.1 | Fixes from code review (ultrareview of Phases 3–3b): null `EmitterPtr` dereference of sky rays in scalar variants; one-sided `thermal_dynamic` emitters glowed from behind on BSDF hits (radiance now scaled by B(T)/B(T_ref) from the emitter's own result at all four call sites, shared helper `thermal_dynamic_scale`); `exchange_sw_<m>` fallback reused the longwave texture; shadow/sky rays were blocked by null-BSDF shapes (now `thermal_trace_opaque`); sun-direction jitter was shifted by half a step (now centred); solar azimuth wrong south of the equator and in the tropics (quadrant-correct atan2 form); `Medium::is_thermal()` not refreshed on parameter updates (`parameters_changed`); `ThermalScene.dynamic()` overwrote the scene's `exchange` setting; caches not invalidated when the `Weather` changes. `ThermalScene` now raises a clear error in scalar variants. 13 regression tests. |
 | 2026-11-15 | 0.7 | Radiative exchange between simulated surfaces: sparse view factors from the hemisphere rays, longwave radiosity (one bounce) and shortwave inter-reflection in the per-element solver; exchange fields per receiver material (`exchange_lw_<m>`, `exchange_sw_<m>`) and `Emitter::thermal_exchange()` in the shading-time model; `ThermalScene` loads with `optimize=False` (the parser merges meshes sharing a BSDF); 3 tests, example 12, assumption A23. |
 | 2026-11-13 | 0.6 | α_s and ε of the thermal solver derived from the BSDF (`bsdf_thermal_properties`, `albedo_spectrum`, `two_band_diffuse`; `ThermalScene(material_from_bsdf=True)` default with disagreement warning); examples 10/11 use spectrally consistent materials; assumption A22. |
 | 2026-11-13 | 0.5 | Shading-time thermal model: `thermal_dynamic` emitter, `EmitterFlags::ThermalDynamic`, `Emitter::thermal_*()` accessors, `thermal_dynamic_temperature()` in `path_ir`/`volpath_ir` (hits and NEE), `DynamicModel` / `ThermalScene.dynamic()`, 5 tests, example 11, assumption A21, references [68, 69]. |

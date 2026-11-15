@@ -39,6 +39,10 @@ MI_VARIANT Medium<Float, Spectrum>::Medium(const Properties &props)
 
 MI_VARIANT Medium<Float, Spectrum>::~Medium() { }
 
+MI_VARIANT void Medium<Float, Spectrum>::parameters_changed(const std::vector<std::string> & /*keys*/) {
+    m_is_thermal = m_temperature->max() > 0.f;
+}
+
 MI_VARIANT Float Medium<Float, Spectrum>::temperature(const MediumInteraction3f &mi,
                                                       Mask active) const {
     return m_temperature->eval_1(mi, active);

@@ -227,3 +227,130 @@ def test06_exchange_dynamic_matches_texture(variants_vec_backends_once_spectral)
     T_roof = res.temperature('roof', t).mean()
     L_ref = 0.92 * ir.band_radiance(9990.0, 10010.0, T_centre) + 0.08 * (0.75 * ir.band_radiance(9990.0, 10010.0, T_roof) + 0.25 * 0)
     assert abs(T_app - ir.apparent_temperature(L_ref, 9990.0, 10010.0)) < 2.0, (T_app, T_centre, T_roof)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the code review of 2026-11-15
+# ---------------------------------------------------------------------------
+
+def _plate_geom():
+    return {'type': 'scene',
+            'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(4),
+                       'bsdf': {'type': 'diffuse', 'reflectance': 0.0}}}
+
+
+def _plate_scene(ts_geom_extra=None, twosided=True, t=13.0, sky_rays=4):
+    # The thermal tables are built under a JIT variant (ThermalScene requires
+    # one); the emitter dictionary holds plain values and renders in any
+    # spectral variant, including scalar ones
+    from mitsuba.ir import thermal as th
+    variant = mi.variant()
+    with mi.scoped_set_variant('llvm_ad_spectral'):
+        geom = _plate_geom()
+        ts = th.ThermalScene(geom, _weather(), {'ground': th.MATERIALS['asphalt']}, resolution=4,
+                             up=(0, 1, 0), north=(0, 0, -1), sky_rays=8, exchange=False)
+        em = ts.dynamic(geom, t, twosided=twosided, exchange=False)['ground']['emitter']
+    d = _plate_geom()                       # rebuilt in the caller's variant
+    d['ground']['emitter'] = em
+    if ts_geom_extra:
+        d.update(ts_geom_extra)
+    return ts, d
+
+
+def _radiance(d, origin, target, up, integ='path_ir', sky_rays=4, spp=16):
+    from mitsuba import ir
+    dd = dict(d)
+    dd['integrator'] = {'type': integ, 'max_depth': 2, 'thermal_up': [0, 1, 0], 'thermal_sky_rays': sky_rays}
+    dd['sensor'] = {'type': 'radiancemeter',
+                    'to_world': mi.ScalarTransform4f().look_at(origin=origin, target=target, up=up),
+                    'sampler': {'type': 'independent', 'sample_count': spp},
+                    'film': ir.band_film((9990.0, 10010.0), 1, 1, rfilter='box')}
+    return float(np.array(mi.render(mi.load_dict(dd), spp=spp)).ravel()[0])
+
+
+def test07_scalar_sky_rays_hit_non_emitter(variant_scalar_spectral):
+    from mitsuba.ir import thermal as th
+    with pytest.raises(RuntimeError, match='JIT variant'):
+        th.ThermalScene(_plate_geom(), _weather(), {'ground': th.MATERIALS['asphalt']})
+    # Sky rays hitting geometry without an emitter (and escaping into an empty
+    # background) used to dereference a null EmitterPtr in scalar variants
+    from mitsuba import ir
+    extra = {'post': {'type': 'cube', 'to_world': mi.ScalarTransform4f().translate([2.5, 0.5, 0]).scale(0.5)}}
+    ts, d = _plate_scene(extra)
+    for integ in ('path_ir', 'volpath_ir'):
+        L = _radiance(d, [0, 3, 0], [0, 0, 0], [0, 0, -1], integ=integ, sky_rays=8)
+        assert np.isfinite(L) and L > 0
+
+
+def test08_one_sided_dynamic_back_face(variants_all_spectral):
+    # A one-sided thermal_dynamic emitter must not emit towards its back
+    # (BSDF hits and NEE agree), for both IR integrators
+    ts, d = _plate_scene(twosided=False)
+    for integ in ('path_ir', 'volpath_ir'):
+        front = _radiance(d, [0, 3, 0], [0, 0, 0], [0, 0, -1], integ=integ)
+        back = _radiance(d, [0, -3, 0], [0, 0, 0], [0, 0, 1], integ=integ)
+        assert front > 0 and back == 0.0, (integ, front, back)
+
+
+def test09_null_bsdf_box_is_transparent(variants_vec_backends_once_spectral):
+    # A null-BSDF box (e.g. a medium boundary from ir.medium_box) above the
+    # plate must not shadow it or hide the sky in the shading-time model
+    from mitsuba import ir
+    ts, d = _plate_scene()
+    L0 = _radiance(d, [0.5, 3, 0.5], [0.5, 0, 0.5], [0, 0, -1], sky_rays=8, spp=64)
+    d2 = dict(d)
+    d2['box'] = {'type': 'cube', 'to_world': mi.ScalarTransform4f().translate([0, 1.0, 0]).scale([50, 0.5, 50]),
+                 'bsdf': {'type': 'null'}}
+    L1 = _radiance(d2, [0.5, 3, 0.5], [0.5, 0, 0.5], [0, 0, -1], sky_rays=8, spp=64)
+    T0 = ir.apparent_temperature(L0, 9990.0, 10010.0)
+    T1 = ir.apparent_temperature(L1, 9990.0, 10010.0)
+    assert abs(T0 - T1) < 0.3, (T0, T1)
+
+
+def test10_dynamic_does_not_change_exchange_setting(variant_llvm_ad_spectral):
+    from mitsuba.ir import thermal as th
+    w = _weather()
+    geom = {'type': 'scene',
+            'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(5),
+                       'bsdf': {'type': 'diffuse', 'reflectance': 0.08}},
+            'roof': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 2, 0]).rotate([1, 0, 0], -90).scale(2),
+                     'bsdf': {'type': 'diffuse', 'reflectance': 0.25}}}
+    mats = {'ground': th.MATERIALS['asphalt'], 'roof': th.MATERIALS['steel_sheet_painted']}
+    ts = th.ThermalScene(geom, w, mats, resolution=8, up=(0, 1, 0), north=(0, 0, -1), sky_rays=32, exchange=False)
+    T_before = ts.run(days=2, dt=600.0, output_times=[22.0]).temperature('ground', 22.0)
+    ts.dynamic(geom, 22.0, exchange=True, days=2)
+    assert ts.exchange is False
+    T_after = ts.run(days=2, dt=600.0, output_times=[22.0]).temperature('ground', 22.0)
+    assert np.allclose(T_before, T_after)
+    d = ts.dynamic(geom, 22.0)                      # default: the scene's setting (no exchange)
+    assert 'exchange_lw_0' not in d['ground']['emitter']
+
+
+def test11_weather_change_invalidates_caches(variant_llvm_ad_spectral):
+    import dataclasses
+    from mitsuba.ir import thermal as th
+    w = _weather()
+    geom = {'type': 'scene',
+            'ground': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(5),
+                       'bsdf': {'type': 'diffuse', 'reflectance': 0.08}}}
+    ts = th.ThermalScene(geom, w, {'ground': th.MATERIALS['asphalt']}, resolution=4, up=(0, 1, 0),
+                         north=(0, 0, -1), sky_rays=8, exchange=False)
+    t_summer = ts.dynamic(geom, 13.0)['ground']['emitter']['t_ref']
+    ts.weather = dataclasses.replace(w, date='2026-12-21')
+    t_winter = ts.dynamic(geom, 13.0)['ground']['emitter']['t_ref']
+    assert t_winter < t_summer - 10.0
+    # Weather objects derived with replace() / mutated do not reuse cached sunrise times
+    w2 = dataclasses.replace(w, date='2026-12-21')
+    assert w2.sunrise_sunset() != w.sunrise_sunset()
+    w.date = '2026-12-21'
+    assert w.sunrise_sunset() == w2.sunrise_sunset()
+
+
+def test12_medium_temperature_update(variants_vec_backends_once_spectral):
+    m = mi.load_dict({'type': 'homogeneous', 'sigma_t': 1.0, 'albedo': 0.0})
+    assert not m.is_thermal()
+    params = mi.traverse(m)
+    key = [k for k in params.keys() if k.startswith('temperature')][0]
+    params[key] = 300.0
+    params.update()
+    assert m.is_thermal()

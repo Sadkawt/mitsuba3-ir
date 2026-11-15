@@ -5,6 +5,8 @@
 #include <mitsuba/core/ray.h>
 #include <mitsuba/core/warp.h>
 #include <mitsuba/render/fwd.h>
+#include <mitsuba/render/interaction.h>
+#include <mitsuba/render/bsdf.h>
 #include <drjit/array.h>
 #include <drjit/math.h>
 #include <drjit/while_loop.h>
@@ -73,6 +75,55 @@ Wavelength planck_radiance(const Wavelength &wavelengths, const Float &T) {
  * \param sky_rays Number of cosine-weighted hemisphere rays
  * \param time     Ray time
  */
+/**
+ * \brief First intersection along ``ray`` that is not a null-BSDF interface
+ *
+ * Shapes with a ``null`` BSDF (medium boundaries, cut-outs) are transparent
+ * to the IR integrators; the shading-time thermal model must see through
+ * them in the same way. Crosses at most 16 null interfaces per ray.
+ */
+template <typename Float, typename Spectrum, typename Scene, typename Ray3f>
+SurfaceInteraction<Float, Spectrum>
+thermal_trace_opaque(const Scene *scene, const Ray3f &ray_, dr::mask_t<Float> active) {
+    using Mask   = dr::mask_t<Float>;
+    using UInt32 = dr::uint32_array_t<Float>;
+    using SurfaceInteraction3f = SurfaceInteraction<Float, Spectrum>;
+
+    SurfaceInteraction3f si = scene->ray_intersect(
+        ray_, +RayFlags::Default, Mask(false), UInt32((uint32_t) RayMask::Secondary), active);
+    if (!scene->has_null_shapes())
+        return si;
+
+    struct Loop {
+        Ray3f ray;
+        SurfaceInteraction3f si;
+        Mask active;
+        UInt32 n;
+        DRJIT_STRUCT(Loop, ray, si, active, n)
+    } l = { ray_, si, active, UInt32(0) };
+
+    dr::tie(l) = dr::while_loop(dr::make_tuple(l),
+        [](const Loop &l) { return l.active; },
+        [scene](Loop &l) {
+            Mask valid = l.si.is_valid();
+            Mask is_null = false;
+            if constexpr (dr::is_jit_v<Float>) {
+                is_null = valid && has_flag(l.si.bsdf()->flags(), BSDFFlags::Null);
+            } else {
+                if (valid)
+                    is_null = has_flag(l.si.bsdf()->flags(), BSDFFlags::Null);
+            }
+            l.active &= is_null && (l.n < 16u);
+            dr::masked(l.ray, l.active) = l.si.spawn_ray(l.ray.d);
+            SurfaceInteraction3f si2 = scene->ray_intersect(
+                l.ray, +RayFlags::Default, Mask(false),
+                UInt32((uint32_t) RayMask::Secondary), l.active);
+            dr::masked(l.si, l.active) = si2;
+            l.n += 1;
+        });
+    return l.si;
+}
+
 template <typename Float, typename Spectrum, typename Scene, typename EmitterPtr,
           typename Sampler, typename Wavelength>
 Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
@@ -93,13 +144,15 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
     Point3f o = p + n * offset;
 
     // --- direct solar history: sum_k w_k cos(theta_k) V_k ---------------------
-    // The sun direction is jittered within each forcing step (one stratum
-    // sample per shading point, interpolating consecutive table entries), so
-    // that the visibility is integrated over the step instead of being
-    // sampled at its centre: this removes the time-step banding of moving
-    // shadow edges without bias.
+    // Table entry k is the centre of forcing step k, and consecutive entries
+    // are consecutive daylight steps (DynamicModel.tables). The sun direction
+    // is jittered symmetrically within the step, t_k + u dt with u in
+    // [-1/2, 1/2), using the central-difference tangent of the sun path, so
+    // that visibility is averaged over the step instead of sampled at its
+    // centre (no time-step banding of moving shadow edges).
     UInt32 n_steps = emitter->thermal_steps();
-    Float u_time = sampler->next_1d(active);
+    Float u_time = sampler->next_1d(active) - ScalarFloat(0.5);
+    bool has_null = scene->has_null_shapes();
     struct Loop {
         UInt32 k;
         Float acc;
@@ -110,15 +163,21 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
         [n_steps](const Loop &l) { return l.k < n_steps; },
         [&](Loop &l) {
             auto [s0, w] = emitter->thermal_forcing(l.k, active);
-            UInt32 k1 = dr::minimum(l.k + 1, n_steps - 1);
-            auto [s1, w1] = emitter->thermal_forcing(k1, active);
-            // Interpolate towards the next entry only when it is a
-            // consecutive daylight step (non-zero weight)
-            Vector3f s = dr::select(w1 != ScalarFloat(0), dr::normalize(s0 + u_time * (s1 - s0)), s0);
+            UInt32 kp = dr::select(l.k > 0u, l.k - 1u, l.k),
+                   kn = dr::minimum(l.k + 1u, n_steps - 1u);
+            Vector3f sp = emitter->thermal_forcing(kp, active).first,
+                     sn = emitter->thermal_forcing(kn, active).first;
+            Float span = Float(kn - kp);
+            Vector3f tangent = dr::select(span > ScalarFloat(0), (sn - sp) / span, Vector3f(0.f));
+            Vector3f s = dr::normalize(s0 + u_time * tangent);
             Float cos_i = dr::dot(n, s);
             Mask lit = active && (cos_i > ScalarFloat(1e-4)) && (w != ScalarFloat(0));
             Ray3f ray(o, s, time, wavelengths);
-            Mask occluded = scene->ray_test(ray, Mask(false), UInt32((uint32_t) RayMask::Secondary), lit);
+            Mask occluded;
+            if (has_null)
+                occluded = thermal_trace_opaque<Float, Spectrum>(scene, ray, lit).is_valid();
+            else
+                occluded = scene->ray_test(ray, Mask(false), UInt32((uint32_t) RayMask::Secondary), lit);
             dr::masked(l.acc, lit && !occluded) += w * cos_i;
             l.k += 1;
         });
@@ -145,13 +204,22 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
             Vector3f d = frame.to_world(d_local);
             Mask above = dr::dot(d, Vector3f(up)) > ScalarFloat(0);
             Ray3f ray(o, d, time, wavelengths);
-            auto si_hit = scene->ray_intersect(ray, +RayFlags::Default, Mask(false),
-                                               UInt32((uint32_t) RayMask::Secondary), active);
+            auto si_hit = thermal_trace_opaque<Float, Spectrum>(scene, ray, active);
             Mask hit = si_hit.is_valid();
             dr::masked(visible, above && !hit) += ScalarFloat(1);
             auto hit_emitter = si_hit.emitter(scene, UInt32((uint32_t) RayMask::Secondary), hit);
-            auto [d_lw, d_sw] = hit_emitter->thermal_exchange(si_hit, m_recv, h_air, s_ref, hit);
-            dr::masked(dT_exchange, hit) += eps * d_lw + alpha * d_sw;
+            Mask has_em = hit && (hit_emitter != nullptr);
+            if constexpr (dr::is_jit_v<Float>) {
+                auto [d_lw, d_sw] = hit_emitter->thermal_exchange(si_hit, m_recv, h_air, s_ref, has_em);
+                dr::masked(dT_exchange, has_em) += eps * d_lw + alpha * d_sw;
+            } else {
+                // Scalar variants: EmitterPtr is a raw pointer (null for
+                // geometry without an emitter)
+                if (has_em) {
+                    auto [d_lw, d_sw] = hit_emitter->thermal_exchange(si_hit, m_recv, h_air, s_ref, has_em);
+                    dT_exchange += eps * d_lw + alpha * d_sw;
+                }
+            }
         }
         F_sky = visible / ScalarFloat(sky_rays);
         dT_exchange /= ScalarFloat(sky_rays);
@@ -175,6 +243,41 @@ Float thermal_dynamic_temperature(const Scene *scene, const EmitterPtr &emitter,
                             h_lin / dr::maximum(h_act, ScalarFloat(0.25) * h_lin),
                             Float(1.f));
     return t_ref + dT_lin * corr;
+}
+
+/**
+ * \brief Radiance scale factor B(lambda, T) / B(lambda, T_ref) of a
+ * thermal-dynamic emitter at surface point (p, n), where T is the
+ * shading-time temperature. Integrators multiply the emitter's own result
+ * (``eval()`` or the next-event-estimation weight, both evaluated at T_ref)
+ * by it, which preserves everything the emitter applied to that result
+ * (one-sided culling, masks). Returns 1 outside the ``active`` lanes and in
+ * non-spectral variants.
+ */
+template <typename Float, typename Spectrum, typename Scene, typename EmitterPtr,
+          typename Sampler, typename Wavelength>
+unpolarized_spectrum_t<Spectrum>
+thermal_dynamic_scale(const Scene *scene, const EmitterPtr &emitter,
+                      const Point<Float, 3> &p, const Normal<Float, 3> &n,
+                      const Vector<dr::scalar_t<Float>, 3> &up, Sampler *sampler,
+                      uint32_t sky_rays, const Float &time,
+                      const Wavelength &wavelengths, dr::mask_t<Float> active) {
+    using UnpolarizedSpectrum = unpolarized_spectrum_t<Spectrum>;
+    using ScalarFloat = dr::scalar_t<Float>;
+    if constexpr (is_spectral_v<Spectrum>) {
+        Float T = thermal_dynamic_temperature<Float, Spectrum>(
+            scene, emitter, p, n, up, sampler, sky_rays, time, wavelengths, active);
+        UnpolarizedSpectrum B     = planck_radiance(wavelengths, T),
+                            B_ref = planck_radiance(wavelengths, Float(emitter->thermal_t_ref()));
+        return dr::select(active, dr::select(B_ref > ScalarFloat(0), B / B_ref, ScalarFloat(0)),
+                          UnpolarizedSpectrum(ScalarFloat(1)));
+    } else {
+        DRJIT_MARK_USED(scene); DRJIT_MARK_USED(emitter); DRJIT_MARK_USED(p);
+        DRJIT_MARK_USED(n); DRJIT_MARK_USED(up); DRJIT_MARK_USED(sampler);
+        DRJIT_MARK_USED(sky_rays); DRJIT_MARK_USED(time);
+        DRJIT_MARK_USED(wavelengths); DRJIT_MARK_USED(active);
+        return UnpolarizedSpectrum(ScalarFloat(1));
+    }
 }
 
 NAMESPACE_END(mitsuba)

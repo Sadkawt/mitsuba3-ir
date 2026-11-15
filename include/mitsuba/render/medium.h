@@ -97,6 +97,10 @@ public:
     /// Does this medium emit thermal radiation (non-zero temperature)?
     MI_INLINE bool is_thermal() const { return m_is_thermal; }
 
+    /// Recompute derived state (e.g. ``is_thermal()``) after parameter updates.
+    /// Plugins that override this must call the base implementation.
+    void parameters_changed(const std::vector<std::string> &keys = {}) override;
+
     /// Returns whether this medium is homogeneous
     MI_INLINE bool is_homogeneous() const { return m_is_homogeneous; }
 

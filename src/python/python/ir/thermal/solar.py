@@ -78,11 +78,11 @@ def solar_position(latitude_deg, longitude_deg, dt_utc):
 
     lat = np.deg2rad(latitude_deg)
     el = np.arcsin(np.sin(dec) * np.sin(lat) + np.cos(dec) * np.cos(lat) * np.cos(ha))
-    az = np.arcsin(np.clip(-np.cos(dec) * np.sin(ha) / np.maximum(np.cos(el), 1e-9), -1.0, 1.0))
-    elc = np.arcsin(np.sin(dec) / np.maximum(np.sin(lat), 1e-9)) if abs(latitude_deg) > 1e-9 else np.full_like(el, np.pi / 2)
-    cond = el >= elc
-    az = np.where(cond, np.pi - az, az)
-    az = np.where((~cond) & (ha > 0), az + 2 * np.pi, az)
+    # Quadrant-correct azimuth (clockwise from north) valid at every latitude;
+    # Michalsky's arcsin form with its elevation test fails south of the
+    # equator and in the tropics
+    az = np.arctan2(-np.sin(ha) * np.cos(dec),
+                    np.sin(dec) * np.cos(lat) - np.cos(dec) * np.sin(lat) * np.cos(ha))
     az = np.mod(az, 2 * np.pi)
 
     # Equation of time [min]: apparent solar time - mean solar time

@@ -150,6 +150,10 @@ class DynamicModel:
         c_sky = float(np.sum(g * q_sky))
         c_ref = float(np.sum(w * self.cos_ref))
         s_now = step_index(t_hours, self.dt, self.n_steps)
+        # Only daylight steps (DNI > 0) are kept. Within one day these form a
+        # contiguous run of steps, so consecutive table entries are consecutive
+        # forcing steps; the shading-time integrator relies on this for its
+        # within-step jitter of the sun direction.
         keep = w != 0.0
         return dict(
             t_ref=float(self.T_ref[s_now]),

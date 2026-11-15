@@ -126,7 +126,7 @@ public:
                 break;
             m_exchange_lw.push_back(props.get_texture<Texture>(lw));
             m_exchange_sw.push_back(props.has_property(sw) ? props.get_texture<Texture>(sw)
-                                                           : props.get_texture<Texture>(lw, 0.f));
+                                                           : props.get_texture<Texture>(sw, 0.f));
         }
 
         std::vector<ScalarFloat> w = parse_list(props.get<std::string_view>("weights", ""));
