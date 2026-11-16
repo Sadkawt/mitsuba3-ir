@@ -354,3 +354,39 @@ def test12_medium_temperature_update(variants_vec_backends_once_spectral):
     params[key] = 300.0
     params.update()
     assert m.is_thermal()
+
+
+def test13_ambient_leaf_model(variants_vec_backends_once_spectral):
+    # Emitter-less surfaces with a nested 'ambient' thermal_dynamic model:
+    # an exposed horizontal leaf plate renders at the model's reference
+    # temperature; the same plate under an opaque roof is cooler at noon
+    from mitsuba import ir
+    from mitsuba.ir import thermal as th
+    from mitsuba.ir.thermal.dynamic import step_index
+    w = _weather()
+    leaf = th.DynamicModel(w, th.MATERIALS['vegetation_canopy'], up=(0, 1, 0), north=(0, 0, -1))
+    t = 13.0
+    amb = leaf.emitter_dict(t)
+    T_ref = float(leaf.T_ref[step_index(t, leaf.dt, leaf.n_steps)])
+    lo, hi = 9990.0, 10010.0
+
+    def T_seen(extra):
+        d = {'type': 'scene',
+             'plate': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().rotate([1, 0, 0], -90).scale(2),
+                       'bsdf': {'type': 'diffuse', 'reflectance': 0.0}},
+             'integrator': {'type': 'path_ir', 'max_depth': 2, 'thermal_up': [0, 1, 0], 'thermal_sky_rays': 8,
+                            'ambient': amb},
+             'sensor': {'type': 'radiancemeter',
+                        'to_world': mi.ScalarTransform4f().look_at(origin=[0, 0.5, 0], target=[0, 0, 0], up=[0, 0, -1]),
+                        'sampler': {'type': 'independent', 'sample_count': 64},
+                        'film': ir.band_film((lo, hi), 1, 1, rfilter='box')}}
+        d.update(extra)
+        return ir.apparent_temperature(float(np.array(mi.render(mi.load_dict(d), spp=64)).ravel()[0]), lo, hi)
+
+    assert abs(T_seen({}) - T_ref) < 0.5
+    roof = {'roof': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 0.8, 0]).rotate([1, 0, 0], 90).scale(20),
+                     'bsdf': {'type': 'diffuse', 'reflectance': 0.0}}}
+    assert T_seen(roof) < T_ref - 3.0
+    # Non-thermal-dynamic nested emitters are rejected
+    with pytest.raises(RuntimeError, match='thermal_dynamic'):
+        mi.load_dict({'type': 'path_ir', 'ambient': {'type': 'thermal', 'temperature': 300.0}})

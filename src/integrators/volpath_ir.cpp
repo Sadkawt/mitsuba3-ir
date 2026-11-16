@@ -42,6 +42,16 @@ Infrared volumetric path tracer (:monosp:`volpath_ir`)
      the emissivity given by their BSDF. Null-BSDF interfaces are excluded.
      (Default: 0, i.e. disabled: such surfaces are at 0 K)
 
+ * - ambient
+   - |emitter|
+   - Optional nested ``thermal_dynamic`` emitter (not attached to a shape)
+     whose shading-time model gives the temperature of emitter-less
+     surfaces at each hit point, evaluated with the zenith ``thermal_up`` as
+     the surface normal: a horizontal leaf layer. Shadow rays from inside a
+     grass sward or a crown are blocked by neighbouring leaves, so sunlit
+     tips, shaded lower leaves and tree shadows on grass all emerge.
+     Overrides ``ambient_temperature``.
+
 This integrator is the volumetric path tracer of Mitsuba (:ref:`volpath
 <integrator-volpath>`) extended with thermal self-emission of *surfaces*
 (:ref:`thermal <emitter-thermal>` emitters, exactly as in :ref:`path_ir
@@ -105,6 +115,16 @@ public:
         m_thermal_up = dr::normalize(props.get<ScalarVector3f>("thermal_up", ScalarVector3f(0.f, 0.f, 1.f)));
         m_sky_rays = props.get<uint32_t>("thermal_sky_rays", 8);
         m_ambient_temperature = props.get<ScalarFloat>("ambient_temperature", 0.f);
+        for (auto &prop : props.objects()) {
+            if (Emitter *e = prop.try_get<Emitter>()) {
+                if (!has_flag(e->flags(), EmitterFlags::ThermalDynamic))
+                    Throw("The nested 'ambient' emitter must be of type 'thermal_dynamic'.");
+                m_ambient = e;
+            } else {
+                Throw("Unsupported nested object \"%s\" (only an 'ambient' thermal_dynamic emitter).",
+                      prop.name());
+            }
+        }
     }
 
     bool thermal_aware() const override { return true; }
@@ -434,12 +454,16 @@ public:
 
                 // Ambient temperature of emitter-less surfaces (see path_ir)
                 if constexpr (is_spectral_v<Spectrum>) {
-                    if (m_ambient_temperature > 0.f) {
+                    if (m_ambient_temperature > 0.f || m_ambient) {
                         EmitterPtr hit_em = si.emitter(scene, ray_mask);
                         Mask ambient = active_surface && (hit_em == nullptr) &&
                                        ((bsdf->flags() & ((uint32_t) BSDFFlags::All & ~(uint32_t) BSDFFlags::Null)) != 0u);
-                        Spectrum B_amb = depolarizer<Spectrum>(
-                            planck_radiance(si.wavelengths, Float(m_ambient_temperature)));
+                        Float T_amb = m_ambient_temperature;
+                        if (m_ambient && dr::any_or<true>(ambient))
+                            T_amb = thermal_dynamic_temperature<Float, Spectrum>(
+                                scene, EmitterPtr(m_ambient.get()), si.p, Normal3f(m_thermal_up),
+                                m_thermal_up, sampler, m_sky_rays, si.time, si.wavelengths, ambient);
+                        Spectrum B_amb = depolarizer<Spectrum>(planck_radiance(si.wavelengths, T_amb));
                         dr::masked(result, ambient) += throughput * B_amb;
                         dr::masked(B_cur, ambient) = B_amb;
                         valid_ray |= ambient;
@@ -701,6 +725,8 @@ private:
     ScalarVector3f m_thermal_up;
     uint32_t m_sky_rays;
     ScalarFloat m_ambient_temperature;
+    /// Optional shading-time temperature model of emitter-less surfaces
+    ref<Emitter> m_ambient;
 };
 
 MI_EXPORT_PLUGIN(VolumetricPathIRIntegrator)

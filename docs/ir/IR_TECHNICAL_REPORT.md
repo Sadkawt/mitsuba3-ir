@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.7.1 — Phase 3b (scene temperatures; shading-time evaluation; BSDF-derived properties; radiative exchange between surfaces) |
+| **Version** | 0.8 — Phase 3b (scene temperatures; shading-time evaluation; BSDF-derived properties; radiative exchange between surfaces) |
 | **Date** | 2026-11-12 |
 | **Base** | Mitsuba 3, `master` @ `aa01500f` (Embree build fix), Dr.Jit as bundled |
 | **Bands** | SWIR (0.9–2.5 µm), MWIR (3–5 µm), LWIR (8–14 µm) |
@@ -1006,6 +1006,37 @@ with one texture lookup); the first run of a new kernel configuration
 incurs a one-time JIT compilation of a few minutes for the CUDA/LLVM
 variants, cached afterwards.
 
+#### 6.8.6 Vegetation without emitters: ambient leaf model
+
+> **A24 — Emitter-less vegetation is a horizontal thin-leaf layer evaluated
+> at shading time.** Instanced geometry (grass blades, leaf clusters)
+> cannot carry emitters in Mitsuba. The IR integrators therefore accept
+> `ambient_temperature` (a constant for every emitter-less, non-null
+> surface) or a nested `ambient` `thermal_dynamic` emitter, typically a
+> `DynamicModel` of a thin leaf (α_s = 0.70, ε = 0.97 from the leaf BSDF).
+> Its shading-time temperature is evaluated at each hit point with the
+> zenith as the surface normal, i.e. with the energy balance of a
+> horizontal leaf whose sun and sky are those *seen from that point*:
+> shadow rays from a blade inside a sward or a leaf inside a crown are
+> blocked by its neighbours.
+
+*Motivation.* Leaves are thin (≈ 0.2 mm) and well coupled to the air;
+their temperature follows the local radiation balance within minutes [53,
+56], so a leaf's own sun/shade state is what matters. Treating every leaf
+point with its actual visibility reproduces the main thermal structure of
+vegetation: sunlit crown tops and blade tips warm, crown interiors and
+lower blades near air temperature, tree shadows on grass cooler. The
+approximations are the horizontal-leaf orientation (the cos θ of a random
+blade is replaced by the canopy-average sin(elevation)), no
+evapotranspiration (A18: sunlit vegetation runs a few kelvin too warm), and
+no exchange between neighbouring leaves beyond the shading. With the
+constant `ambient_temperature` instead, all vegetation is isothermal and
+tree shadows on grass disappear, which looks markedly unrealistic.
+Validation: `test_path_ir::test08` (constant: (1 − ρ)B, isothermal cavity,
+null surfaces excluded) and `test_ir_thermal_dynamic::test13` (exposed
+leaf plate at the model's reference temperature, > 3 K cooler under a roof
+at noon).
+
 ---
 
 ## 7. Helper library and examples
@@ -1051,6 +1082,7 @@ variants, cached afterwards.
 | `11_thermal_dynamic.py` | Same scene at 14:00 with `thermal_dynamic` emitters vs the 25 cm texture solver, close-up of the wall/tree shadows, timings | Resolution-free shadow edges; cost scales with shading points |
 | `12_radiative_exchange.py` | Street canyon with a heated vehicle at 22:00, with/without surface-to-surface exchange; probes and difference image | Canyon floor and wall bases several kelvin warmer with exchange; ground under the vehicle warmer still |
 | `13_timelapse_car.py` | Time-lapse video (command-line start/stop/step, date, location, weather) of a car on grass beside a tree; one per-element solve per day, every frame rendered with `thermal_dynamic` emitters at its own time; fixed colour scale over the sequence | Canopy shadow sweeping across the car with sharp edges; cooling memory of the shaded roof and grass; cabin shadow on the rear deck in the late afternoon |
+| `14_timelapse_landscape.py` | Time lapse of a 400 × 400 m landscape with ground, aerial and top-down views: 360 k instanced grass tufts (21 M blades) and tree crowns from leaf clusters (ambient leaf model, A24), asphalt road, gravel pad, dirt path, concrete slab with a metal-roofed shed, mixed pond, rocks, two cars (one with a warm engine); uncooled-camera look (white-hot, NETD, optical blur, robust gain) | Grass texture from blade self-shading; tree shadows on grass; road and gravel hottest, pond and metal roof coldest; ≈ 60 s per 960 × 540 frame on an RTX 4070 |
 
 ---
 
@@ -1324,6 +1356,7 @@ Known limitations of the present state:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-11-16 | 0.8 | `ambient_temperature` and nested `ambient` (shading-time leaf model) for emitter-less surfaces in `path_ir` / `volpath_ir`; `ThermalScene(reference_normal='up')` and models shared between equal materials; example 14 (landscape with instanced grass, aerial views); assumption A24. |
 | 2026-11-15 | 0.7.1 | Fixes from code review (ultrareview of Phases 3–3b): null `EmitterPtr` dereference of sky rays in scalar variants; one-sided `thermal_dynamic` emitters glowed from behind on BSDF hits (radiance now scaled by B(T)/B(T_ref) from the emitter's own result at all four call sites, shared helper `thermal_dynamic_scale`); `exchange_sw_<m>` fallback reused the longwave texture; shadow/sky rays were blocked by null-BSDF shapes (now `thermal_trace_opaque`); sun-direction jitter was shifted by half a step (now centred); solar azimuth wrong south of the equator and in the tropics (quadrant-correct atan2 form); `Medium::is_thermal()` not refreshed on parameter updates (`parameters_changed`); `ThermalScene.dynamic()` overwrote the scene's `exchange` setting; caches not invalidated when the `Weather` changes. `ThermalScene` now raises a clear error in scalar variants. 13 regression tests. |
 | 2026-11-15 | 0.7 | Radiative exchange between simulated surfaces: sparse view factors from the hemisphere rays, longwave radiosity (one bounce) and shortwave inter-reflection in the per-element solver; exchange fields per receiver material (`exchange_lw_<m>`, `exchange_sw_<m>`) and `Emitter::thermal_exchange()` in the shading-time model; `ThermalScene` loads with `optimize=False` (the parser merges meshes sharing a BSDF); 3 tests, example 12, assumption A23. |
 | 2026-11-13 | 0.6 | α_s and ε of the thermal solver derived from the BSDF (`bsdf_thermal_properties`, `albedo_spectrum`, `two_band_diffuse`; `ThermalScene(material_from_bsdf=True)` default with disagreement warning); examples 10/11 use spectrally consistent materials; assumption A22. |
