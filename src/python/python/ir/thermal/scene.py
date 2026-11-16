@@ -299,7 +299,7 @@ class ThermalScene:
 
     def __init__(self, scene_dict, weather, materials, resolution=64, up=(0, 0, 1),
                  north=(0, 1, 0), sky_rays=128, T_surroundings=None, seed=0, mesh_mode='auto',
-                 material_from_bsdf=True, tolerance=0.05, exchange=True):
+                 material_from_bsdf=True, tolerance=0.05, exchange=True, reference_normal='auto'):
         import mitsuba as mi
         if not (mi.variant().startswith('llvm') or mi.variant().startswith('cuda')):
             raise RuntimeError(
@@ -328,6 +328,9 @@ class ThermalScene:
         self.eps = 1e-4 * float(np.linalg.norm(np.array(bbox.max) - np.array(bbox.min)))
         self._rng = np.random.default_rng(seed)
         self.exchange = bool(exchange)
+        if reference_normal not in ('auto', 'up'):
+            raise ValueError("reference_normal must be 'auto' or 'up'")
+        self.reference_normal = reference_normal
         # Global element indexing (concatenation of the shapes in order)
         self._keys = list(self.shapes)
         self._offsets = {}
@@ -499,9 +502,13 @@ class ThermalScene:
     # --- shading-time (linear response) model -----------------------------------
     def dynamic_models(self, dt=600.0, days_memory=6, ref_days=4):
         """
-        :class:`DynamicModel` per simulated shape (cached). The reference
-        element of a shape has the shape's mean normal when it is well
-        defined (plates, roofs) and the zenith otherwise (closed objects).
+        :class:`DynamicModel` per simulated shape (cached, shared between
+        shapes with equal material and reference normal). With
+        ``reference_normal='auto'`` the reference element of a shape has the
+        shape's mean normal when it is well defined (plates, roofs) and the
+        zenith otherwise (closed objects); with ``'up'`` it is always the
+        zenith, which keeps the number of distinct models (and exchange
+        fields) equal to the number of materials in scenes with many shapes.
         """
         from .dynamic import DynamicModel
         key_dt = (float(dt), int(days_memory), int(ref_days), self.weather.signature(),
@@ -511,9 +518,11 @@ class ThermalScene:
             cache = {'params': key_dt, 'models': {}}
         models = {}
         for key, sh in self.shapes.items():
-            n_ref = _mean_normal(sh)
+            n_ref = _mean_normal(sh) if self.reference_normal == 'auto' else None
             n_ref = self.up if n_ref is None else n_ref
-            ck = (id(sh.material), tuple(np.round(n_ref, 3)))
+            # Material is a frozen (hashable) dataclass: key by value, so that
+            # equal materials share one model
+            ck = (sh.material, tuple(np.round(n_ref, 3)))
             if ck not in cache['models']:
                 cache['models'][ck] = DynamicModel(self.weather, sh.material, dt=dt, days_memory=days_memory,
                                                    reference_normal=n_ref, up=self.up, north=self.north,

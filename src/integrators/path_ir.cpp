@@ -36,6 +36,14 @@ Infrared path tracer (:monosp:`path_ir`)
    - Clamp positive (emitted) contributions of direct/indirect paths. The
      thermal difference terms are never clamped. (Default: 0, i.e. disabled)
 
+ * - ambient_temperature
+   - |float|
+   - Temperature [K] assigned to surfaces that carry no emitter (for example
+     instanced geometry such as grass blades, which cannot hold emitters).
+     They then radiate like ``thermal`` surfaces at this temperature, with
+     the emissivity given by their BSDF. Null-BSDF interfaces are excluded.
+     (Default: 0, i.e. disabled: such surfaces are at 0 K)
+
 This integrator is the unidirectional path tracer of Mitsuba (:ref:`path
 <integrator-path>`) extended with *thermal self-emission* of surfaces for
 infrared rendering. It handles emitters flagged as ``EmitterFlags::Thermal``
@@ -110,6 +118,7 @@ public:
     PathIRIntegrator(const Properties &props) : Base(props) {
         m_thermal_up = dr::normalize(props.get<ScalarVector3f>("thermal_up", ScalarVector3f(0.f, 0.f, 1.f)));
         m_sky_rays = props.get<uint32_t>("thermal_sky_rays", 8);
+        m_ambient_temperature = props.get<ScalarFloat>("ambient_temperature", 0.f);
     }
 
     bool thermal_aware() const override { return true; }
@@ -256,6 +265,23 @@ public:
 
             BSDFPtr bsdf = si.bsdf();
             UInt32 bsdf_flags = bsdf->flags();
+
+            // ------------- Ambient temperature of emitter-less surfaces -------------
+            // Surfaces without an emitter (e.g. instanced geometry) radiate as
+            // thermal surfaces at 'ambient_temperature'. They cannot be reached
+            // by emitter sampling, so the full blackbody term is added here.
+            if constexpr (is_spectral_v<Spectrum>) {
+                if (m_ambient_temperature > 0.f) {
+                    Mask ambient = si.is_valid() && (emitter == nullptr) &&
+                                   ((bsdf_flags & ((uint32_t) BSDFFlags::All & ~(uint32_t) BSDFFlags::Null)) != 0u);
+                    Spectrum B_amb = depolarizer<Spectrum>(
+                        planck_radiance(si.wavelengths, Float(m_ambient_temperature)));
+                    dr::masked(ls.result, ambient) += ls.throughput * B_amb;
+                    dr::masked(L_e, ambient) = B_amb;
+                    is_thermal |= ambient;
+                    ls.valid_ray |= ambient;
+                }
+            }
 
             // Continue tracing the path at this point? Null crossings don't
             // count when checking for the max_depth cutoff.
@@ -421,6 +447,8 @@ private:
     /// Zenith direction and number of sky-view rays for thermal_dynamic emitters
     ScalarVector3f m_thermal_up;
     uint32_t m_sky_rays;
+    /// Temperature of surfaces without an emitter (0 = none)
+    ScalarFloat m_ambient_temperature;
 };
 
 MI_EXPORT_PLUGIN(PathIRIntegrator)

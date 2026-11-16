@@ -236,3 +236,34 @@ def test07_thermal_plus_solar_mixed(variants_all_spectral):
     width = band[1] - band[0]
     ref = (1 - rho) * band_radiance(*band, T) + rho * E * width / np.pi
     assert np.isclose(value, ref, rtol=5e-3), (value, ref)
+
+
+@pytest.mark.parametrize('integrator', ['path_ir', 'volpath_ir'])
+def test08_ambient_temperature(variants_all_spectral, integrator):
+    # Surfaces without an emitter radiate at 'ambient_temperature' with the
+    # emissivity of their BSDF; null-BSDF interfaces do not
+    rho, T = 0.3, 300.0
+    scene = {
+        'type': 'scene',
+        'integrator': {'type': integrator, 'max_depth': 8, 'ambient_temperature': T},
+        'sensor': sensor_dict([0, 0, 1], [0, 0, 0], NARROW, 16),
+        'plate': {'type': 'rectangle', 'bsdf': {'type': 'diffuse', 'reflectance': rho}},
+        'window': {'type': 'rectangle', 'to_world': mi.ScalarTransform4f().translate([0, 0, 0.5]),
+                   'bsdf': {'type': 'null'}},
+    }
+    value = render_value(scene, spp=16)
+    ref = (1 - rho) * band_radiance(*NARROW, T)
+    assert np.isclose(value, ref, rtol=2e-3), (value, ref)
+    # Disabled by default: the plate is at 0 K
+    scene['integrator'] = {'type': integrator, 'max_depth': 8}
+    assert render_value(scene, spp=16) == 0.0
+    # Isothermal consistency: emitter-less cavity wall at the ambient temperature
+    scene = {
+        'type': 'scene',
+        'integrator': {'type': integrator, 'max_depth': 32, 'rr_depth': 32, 'ambient_temperature': T},
+        'sensor': sensor_dict([0, 0, 0], [0.3, 0.2, 1], NARROW, 16),
+        'cavity': {'type': 'sphere', 'radius': 1.0,
+                   'bsdf': {'type': 'twosided', 'bsdf': {'type': 'diffuse', 'reflectance': 0.6}}},
+    }
+    value = render_value(scene, spp=16)
+    assert np.isclose(value, band_radiance(*NARROW, T), rtol=2e-3), value

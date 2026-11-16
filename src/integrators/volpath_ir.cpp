@@ -34,6 +34,14 @@ Infrared volumetric path tracer (:monosp:`volpath_ir`)
    - Clamp positive (emitted) contributions of direct/indirect paths. The thermal
      difference terms are never clamped. (Default: 0, i.e. disabled)
 
+ * - ambient_temperature
+   - |float|
+   - Temperature [K] assigned to surfaces that carry no emitter (for example
+     instanced geometry such as grass blades, which cannot hold emitters).
+     They then radiate like ``thermal`` surfaces at this temperature, with
+     the emissivity given by their BSDF. Null-BSDF interfaces are excluded.
+     (Default: 0, i.e. disabled: such surfaces are at 0 K)
+
 This integrator is the volumetric path tracer of Mitsuba (:ref:`volpath
 <integrator-volpath>`) extended with thermal self-emission of *surfaces*
 (:ref:`thermal <emitter-thermal>` emitters, exactly as in :ref:`path_ir
@@ -96,6 +104,7 @@ public:
     VolumetricPathIRIntegrator(const Properties &props) : Base(props) {
         m_thermal_up = dr::normalize(props.get<ScalarVector3f>("thermal_up", ScalarVector3f(0.f, 0.f, 1.f)));
         m_sky_rays = props.get<uint32_t>("thermal_sky_rays", 8);
+        m_ambient_temperature = props.get<ScalarFloat>("ambient_temperature", 0.f);
     }
 
     bool thermal_aware() const override { return true; }
@@ -422,6 +431,20 @@ public:
                 // --------------------- Emitter sampling ---------------------
                 BSDFContext ctx;
                 BSDFPtr bsdf  = si.bsdf();
+
+                // Ambient temperature of emitter-less surfaces (see path_ir)
+                if constexpr (is_spectral_v<Spectrum>) {
+                    if (m_ambient_temperature > 0.f) {
+                        EmitterPtr hit_em = si.emitter(scene, ray_mask);
+                        Mask ambient = active_surface && (hit_em == nullptr) &&
+                                       ((bsdf->flags() & ((uint32_t) BSDFFlags::All & ~(uint32_t) BSDFFlags::Null)) != 0u);
+                        Spectrum B_amb = depolarizer<Spectrum>(
+                            planck_radiance(si.wavelengths, Float(m_ambient_temperature)));
+                        dr::masked(result, ambient) += throughput * B_amb;
+                        dr::masked(B_cur, ambient) = B_amb;
+                        valid_ray |= ambient;
+                    }
+                }
                 Mask active_e = active_surface && bsdf->has_flag(BSDFFlags::Smooth) && (depth + 1 < (uint32_t) m_max_depth);
 
                 if (likely(dr::any_or<true>(active_e))) {
@@ -677,6 +700,7 @@ private:
     /// Zenith direction and number of sky-view rays for thermal_dynamic emitters
     ScalarVector3f m_thermal_up;
     uint32_t m_sky_rays;
+    ScalarFloat m_ambient_temperature;
 };
 
 MI_EXPORT_PLUGIN(VolumetricPathIRIntegrator)
